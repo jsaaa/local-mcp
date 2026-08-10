@@ -14,6 +14,133 @@ use uuid::Uuid;
 use crate::{approvals, config, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const IMAGE_VIEWER_URI: &str = "ui://local-mcp/image-viewer-v1.html";
+const MCP_APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
+const IMAGE_VIEWER_HTML: &str = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+  body { font-family: var(--font-sans, system-ui, sans-serif); }
+  #status { padding: 12px; color: var(--color-text-secondary, #666); }
+  #image { display: block; max-width: 100%; height: auto; border-radius: var(--border-radius-md, 8px); }
+</style>
+</head>
+<body>
+<div id="status">Loading image…</div>
+<img id="image" alt="Image returned by local-mcp" hidden>
+<script>
+(() => {
+  const imageEl = document.getElementById("image");
+  const statusEl = document.getElementById("status");
+  const pending = new Map();
+  let nextId = 1;
+
+  function post(message) {
+    window.parent.postMessage(message, "*");
+  }
+
+  function request(method, params) {
+    const id = nextId++;
+    post({ jsonrpc: "2.0", id, method, params });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`${method} timed out`));
+      }, 3000);
+      pending.set(id, { resolve, reject, timer });
+    });
+  }
+
+  function notify(method, params = {}) {
+    post({ jsonrpc: "2.0", method, params });
+  }
+
+  function notifySize() {
+    const rect = document.documentElement.getBoundingClientRect();
+    notify("ui/notifications/size-changed", {
+      width: Math.ceil(rect.width),
+      height: Math.ceil(rect.height),
+    });
+  }
+
+  function renderToolResult(result) {
+    const content = Array.isArray(result?.content) ? result.content : [];
+    const image = content.find((item) =>
+      item && item.type === "image" && typeof item.data === "string"
+    );
+    if (!image) return false;
+
+    const mimeType = typeof image.mimeType === "string" ? image.mimeType : "image/png";
+    imageEl.onload = notifySize;
+    imageEl.src = `data:${mimeType};base64,${image.data}`;
+    imageEl.hidden = false;
+    statusEl.hidden = true;
+    return true;
+  }
+
+  function renderFromOpenAiCompatibilityBridge() {
+    const metadata = window.openai?.toolResponseMetadata;
+    return renderToolResult(metadata?.mcp_tool_result) ||
+      renderToolResult(metadata?.call_tool_result);
+  }
+
+  window.addEventListener("openai:set_globals", () => {
+    renderFromOpenAiCompatibilityBridge();
+  }, { passive: true });
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window.parent) return;
+    const message = event.data;
+    if (!message || message.jsonrpc !== "2.0") return;
+
+    if (message.id !== undefined && pending.has(message.id)) {
+      const entry = pending.get(message.id);
+      pending.delete(message.id);
+      clearTimeout(entry.timer);
+      if (message.error) entry.reject(message.error);
+      else entry.resolve(message.result);
+      return;
+    }
+
+    if (message.method === "ui/notifications/tool-result") {
+      renderToolResult(message.params);
+    }
+  }, { passive: true });
+
+  async function initialize() {
+    try {
+      await request("ui/initialize", {
+        protocolVersion: "2026-01-26",
+        appInfo: { name: "local-mcp image viewer", version: "1.0.0" },
+        appCapabilities: { availableDisplayModes: ["inline"] },
+      });
+      notify("ui/notifications/initialized");
+      return;
+    } catch (_) {
+      // Compatibility with hosts implementing the earlier MCP Apps handshake.
+    }
+
+    try {
+      await request("initialize", {
+        protocolVersion: "2026-01-26",
+        clientInfo: { name: "local-mcp image viewer", version: "1.0.0" },
+        capabilities: {},
+      });
+      notify("notifications/initialized");
+    } catch (error) {
+      statusEl.textContent = "Image viewer initialization failed.";
+    }
+  }
+
+  renderFromOpenAiCompatibilityBridge();
+  initialize();
+})();
+</script>
+</body>
+</html>"#;
 
 struct Job {
     session_id: String,
@@ -72,15 +199,50 @@ async fn dispatch(request: &Value) -> Result<Value> {
     {
         "initialize" => Ok(json!({
             "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {"listChanged": false}},
+            "capabilities": {
+                "tools": {"listChanged": false},
+                "resources": {"subscribe": false, "listChanged": false}
+            },
             "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
             "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
         "tools/call" => call_tool(request.get("params").unwrap_or(&Value::Null)).await,
+        "resources/list" => Ok(json!({"resources": resources()})),
+        "resources/read" => read_resource(request.get("params").unwrap_or(&Value::Null)),
         method => anyhow::bail!("method not found: {method}"),
     }
+}
+
+fn resources() -> Value {
+    json!([{
+        "uri": IMAGE_VIEWER_URI,
+        "name": "local_mcp_image_viewer",
+        "description": "Inline viewer for images returned by get_image.",
+        "mimeType": MCP_APP_MIME_TYPE
+    }])
+}
+
+fn read_resource(params: &Value) -> Result<Value> {
+    let uri = params
+        .get("uri")
+        .and_then(Value::as_str)
+        .context("missing resource uri")?;
+    anyhow::ensure!(uri == IMAGE_VIEWER_URI, "unknown resource: {uri}");
+
+    Ok(json!({
+        "contents": [{
+            "uri": IMAGE_VIEWER_URI,
+            "mimeType": MCP_APP_MIME_TYPE,
+            "text": IMAGE_VIEWER_HTML,
+            "_meta": {
+                "ui": {"prefersBorder": false},
+                "openai/widgetPrefersBorder": false,
+                "openai/widgetDescription": "Displays the image returned by local-mcp."
+            }
+        }]
+    }))
 }
 
 fn tools() -> Value {
@@ -100,7 +262,7 @@ fn tools() -> Value {
     let mut tools = json!([
         {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"read_file","description":"Read a UTF-8 file from the local machine. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
-        {"name":"get_image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
+        {"name":"get_image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false},"_meta":{"ui":{"resourceUri":IMAGE_VIEWER_URI,"visibility":["model","app"]},"openai/outputTemplate":IMAGE_VIEWER_URI,"openai/toolInvocation/invoking":"Reading image…","openai/toolInvocation/invoked":"Image ready"}},
         {"name":"list_directory","description":"List entries in a local directory. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
         {"name":"write_file","description":write_file_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
         {"name":"execute","description":execute_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
@@ -688,5 +850,58 @@ mod tests {
         tokio::fs::remove_dir_all(directory).await.unwrap();
 
         assert_eq!(result["content"][0]["mimeType"], "image/gif");
+    }
+
+    #[test]
+    fn get_image_tool_declares_image_viewer_ui() {
+        let tools = tools();
+        let get_image = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "get_image")
+            .unwrap();
+
+        assert_eq!(
+            get_image.pointer("/_meta/ui/resourceUri").and_then(Value::as_str),
+            Some(IMAGE_VIEWER_URI)
+        );
+        assert_eq!(
+            get_image
+                .pointer("/_meta/openai~1outputTemplate")
+                .and_then(Value::as_str),
+            Some(IMAGE_VIEWER_URI)
+        );
+        assert_eq!(
+            get_image
+                .pointer("/_meta/ui/visibility")
+                .and_then(Value::as_array)
+                .unwrap(),
+            &vec![json!("model"), json!("app")]
+        );
+    }
+
+    #[test]
+    fn image_viewer_resource_is_valid_mcp_app_html() {
+        let listed = resources();
+        let resource = &listed.as_array().unwrap()[0];
+        assert_eq!(resource["uri"], IMAGE_VIEWER_URI);
+        assert_eq!(resource["mimeType"], MCP_APP_MIME_TYPE);
+
+        let result = read_resource(&json!({"uri": IMAGE_VIEWER_URI})).unwrap();
+        let content = &result["contents"][0];
+        assert_eq!(content["uri"], IMAGE_VIEWER_URI);
+        assert_eq!(content["mimeType"], MCP_APP_MIME_TYPE);
+        let html = content["text"].as_str().unwrap();
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("ui/notifications/tool-result"));
+        assert!(html.contains("data:${mimeType};base64,${image.data}"));
+        assert!(html.contains("toolResponseMetadata"));
+    }
+
+    #[test]
+    fn rejects_unknown_ui_resource() {
+        let error = read_resource(&json!({"uri": "ui://local-mcp/unknown.html"})).unwrap_err();
+        assert!(error.to_string().contains("unknown resource"));
     }
 }
