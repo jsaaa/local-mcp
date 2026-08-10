@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -14,6 +14,9 @@ use uuid::Uuid;
 use crate::{approvals, config, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const HEARTBEAT_DEFAULT_NAME: &str = "default";
+const HEARTBEAT_MAX_WAIT: Duration = Duration::from_secs(25);
+const HEARTBEAT_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const IMAGE_VIEWER_URI: &str = "ui://local-mcp/image-viewer-v1.html";
 const MCP_APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
 const IMAGE_VIEWER_HTML: &str = r#"<!doctype html>
@@ -153,6 +156,47 @@ fn jobs() -> &'static Mutex<HashMap<Uuid, Job>> {
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Debug)]
+struct Heartbeat {
+    interval: Duration,
+    next_tick: Instant,
+    delivered_ticks: u64,
+    skipped_ticks: u64,
+    waiting: bool,
+    generation: u64,
+}
+
+impl Heartbeat {
+    fn new(interval: Duration, now: Instant, generation: u64) -> Self {
+        Self {
+            interval,
+            next_tick: now + interval,
+            delivered_ticks: 0,
+            skipped_ticks: 0,
+            waiting: false,
+            generation,
+        }
+    }
+}
+
+fn heartbeats() -> &'static Mutex<HashMap<(String, String), Heartbeat>> {
+    static HEARTBEATS: OnceLock<Mutex<HashMap<(String, String), Heartbeat>>> = OnceLock::new();
+    HEARTBEATS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn skip_missed_heartbeat_ticks(heartbeat: &mut Heartbeat, now: Instant) -> u64 {
+    if now < heartbeat.next_tick {
+        return 0;
+    }
+
+    let interval_seconds = heartbeat.interval.as_secs();
+    let overdue_seconds = now.duration_since(heartbeat.next_tick).as_secs();
+    let missed = overdue_seconds / interval_seconds + 1;
+    heartbeat.next_tick += Duration::from_secs(interval_seconds.saturating_mul(missed));
+    heartbeat.skipped_ticks = heartbeat.skipped_ticks.saturating_add(missed);
+    missed
+}
+
 pub async fn serve() -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
@@ -269,6 +313,10 @@ fn tools() -> Value {
         {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"heartbeat_start","description":"Start or reset an in-turn heartbeat schedule for this local-mcp session. After starting it, call heartbeat_wait repeatedly. A tick is delivered only while heartbeat_wait is actively waiting; ticks that occur while the agent is busy doing work are skipped instead of queued.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"interval_seconds":{"type":"integer","minimum":1,"maximum":86400},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id","interval_seconds"],"additionalProperties":false}},
+        {"name":"heartbeat_wait","description":"Wait for the next heartbeat tick in short long-poll chunks. Call this repeatedly until status is tick, then do one work cycle and call it again. If a scheduled tick passes while no heartbeat_wait call is active because the agent is still working, that tick is skipped. This does not revive a ChatGPT turn after the turn has ended.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"max_wait_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"heartbeat_status","description":"Show the current in-turn heartbeat schedule, delivered tick count, skipped tick count, and time until the next tick.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"heartbeat_stop","description":"Stop and remove an in-turn heartbeat schedule for this local-mcp session.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
         {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
     ]);
     for tool in tools.as_array_mut().unwrap() {
@@ -338,9 +386,186 @@ async fn call_tool(params: &Value) -> Result<Value> {
         "start_command" => start_command(&args, &session).await,
         "poll_job" => poll_job(&args, &session).await,
         "stop_job" => stop_job(&args, &session).await,
+        "heartbeat_start" => heartbeat_start(&args, &session).await,
+        "heartbeat_wait" => heartbeat_wait(&args, &session).await,
+        "heartbeat_status" => heartbeat_status(&args, &session).await,
+        "heartbeat_stop" => heartbeat_stop(&args, &session).await,
         "without_sandbox" => without_sandbox(&args, &session).await,
         _ => anyhow::bail!("unknown tool: {name}"),
     }
+}
+
+fn heartbeat_name(args: &Value) -> Result<String> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(HEARTBEAT_DEFAULT_NAME);
+    anyhow::ensure!(!name.is_empty(), "heartbeat name must not be empty");
+    anyhow::ensure!(name.len() <= 64, "heartbeat name must be at most 64 bytes");
+    anyhow::ensure!(
+        name.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "heartbeat name may contain only ASCII letters, digits, '.', '_' and '-'"
+    );
+    Ok(name.to_owned())
+}
+
+fn heartbeat_key(session_id: &str, name: &str) -> (String, String) {
+    (session_id.to_owned(), name.to_owned())
+}
+
+fn heartbeat_interval(args: &Value) -> Result<Duration> {
+    let seconds = args
+        .get("interval_seconds")
+        .and_then(Value::as_u64)
+        .context("missing interval_seconds")?;
+    let interval = Duration::from_secs(seconds);
+    anyhow::ensure!(!interval.is_zero(), "interval_seconds must be at least 1");
+    anyhow::ensure!(
+        interval <= HEARTBEAT_MAX_INTERVAL,
+        "interval_seconds must be at most {}",
+        HEARTBEAT_MAX_INTERVAL.as_secs()
+    );
+    Ok(interval)
+}
+
+fn heartbeat_max_wait(args: &Value) -> Result<Duration> {
+    let seconds = args
+        .get("max_wait_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(HEARTBEAT_MAX_WAIT.as_secs());
+    let wait = Duration::from_secs(seconds);
+    anyhow::ensure!(!wait.is_zero(), "max_wait_seconds must be at least 1");
+    anyhow::ensure!(
+        wait <= HEARTBEAT_MAX_WAIT,
+        "max_wait_seconds must be at most {}",
+        HEARTBEAT_MAX_WAIT.as_secs()
+    );
+    Ok(wait)
+}
+
+fn heartbeat_result(
+    name: &str,
+    status: &str,
+    heartbeat: &Heartbeat,
+    now: Instant,
+) -> Result<Value> {
+    let remaining = heartbeat.next_tick.saturating_duration_since(now);
+    text_result(serde_json::to_string_pretty(&json!({
+        "name": name,
+        "status": status,
+        "interval_seconds": heartbeat.interval.as_secs(),
+        "next_tick_in_ms": remaining.as_millis().min(u64::MAX as u128) as u64,
+        "delivered_ticks": heartbeat.delivered_ticks,
+        "skipped_ticks": heartbeat.skipped_ticks,
+    }))?)
+}
+
+async fn heartbeat_start(args: &Value, session: &config::Session) -> Result<Value> {
+    let name = heartbeat_name(args)?;
+    let interval = heartbeat_interval(args)?;
+    let key = heartbeat_key(&session.id, &name);
+    let now = Instant::now();
+    let result = {
+        let mut all = heartbeats().lock().unwrap();
+        let generation = all
+            .get(&key)
+            .map(|heartbeat| heartbeat.generation.saturating_add(1))
+            .unwrap_or(1);
+        all.insert(key.clone(), Heartbeat::new(interval, now, generation));
+        heartbeat_result(&name, "started", all.get(&key).unwrap(), now)?
+    };
+    approvals::activity(
+        &session.id,
+        format!("Started heartbeat {name} every {}s", interval.as_secs()),
+        None,
+    )
+    .await;
+    Ok(result)
+}
+
+async fn heartbeat_wait(args: &Value, session: &config::Session) -> Result<Value> {
+    let name = heartbeat_name(args)?;
+    let max_wait = heartbeat_max_wait(args)?;
+    let key = heartbeat_key(&session.id, &name);
+
+    let (target, generation, wait_for) = {
+        let mut all = heartbeats().lock().unwrap();
+        let heartbeat = all.get_mut(&key).with_context(|| {
+            format!("heartbeat {name:?} is not running; call heartbeat_start first")
+        })?;
+        anyhow::ensure!(
+            !heartbeat.waiting,
+            "heartbeat {name:?} already has an active waiter"
+        );
+        skip_missed_heartbeat_ticks(heartbeat, Instant::now());
+        heartbeat.waiting = true;
+        let target = heartbeat.next_tick;
+        let wait_for = target
+            .saturating_duration_since(Instant::now())
+            .min(max_wait);
+        (target, heartbeat.generation, wait_for)
+    };
+
+    tokio::time::sleep(wait_for).await;
+    let now = Instant::now();
+    let mut all = heartbeats().lock().unwrap();
+    let heartbeat = all
+        .get_mut(&key)
+        .with_context(|| format!("heartbeat {name:?} was stopped while waiting"))?;
+    anyhow::ensure!(
+        heartbeat.generation == generation,
+        "heartbeat {name:?} was restarted while waiting"
+    );
+    heartbeat.waiting = false;
+
+    if now >= target && heartbeat.next_tick == target {
+        heartbeat.delivered_ticks = heartbeat.delivered_ticks.saturating_add(1);
+        heartbeat.next_tick += heartbeat.interval;
+        skip_missed_heartbeat_ticks(heartbeat, now);
+        let result = heartbeat_result(&name, "tick", heartbeat, now);
+        drop(all);
+        approvals::activity(&session.id, format!("Heartbeat {name} tick"), None).await;
+        return result;
+    }
+
+    heartbeat_result(&name, "waiting", heartbeat, now)
+}
+
+async fn heartbeat_status(args: &Value, session: &config::Session) -> Result<Value> {
+    let name = heartbeat_name(args)?;
+    let key = heartbeat_key(&session.id, &name);
+    let now = Instant::now();
+    let mut all = heartbeats().lock().unwrap();
+    let heartbeat = all
+        .get_mut(&key)
+        .with_context(|| format!("heartbeat {name:?} is not running"))?;
+    if !heartbeat.waiting {
+        skip_missed_heartbeat_ticks(heartbeat, now);
+    }
+    heartbeat_result(
+        &name,
+        if heartbeat.waiting { "waiting" } else { "idle" },
+        heartbeat,
+        now,
+    )
+}
+
+async fn heartbeat_stop(args: &Value, session: &config::Session) -> Result<Value> {
+    let name = heartbeat_name(args)?;
+    let key = heartbeat_key(&session.id, &name);
+    let heartbeat = heartbeats()
+        .lock()
+        .unwrap()
+        .remove(&key)
+        .with_context(|| format!("heartbeat {name:?} is not running"))?;
+    approvals::activity(&session.id, format!("Stopped heartbeat {name}"), None).await;
+    text_result(serde_json::to_string_pretty(&json!({
+        "name": name,
+        "status": "stopped",
+        "delivered_ticks": heartbeat.delivered_ticks,
+        "skipped_ticks": heartbeat.skipped_ticks,
+    }))?)
 }
 
 async fn report_result<T>(session_id: &str, title: String, result: &Result<T>) {
@@ -863,7 +1088,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            get_image.pointer("/_meta/ui/resourceUri").and_then(Value::as_str),
+            get_image
+                .pointer("/_meta/ui/resourceUri")
+                .and_then(Value::as_str),
             Some(IMAGE_VIEWER_URI)
         );
         assert_eq!(
@@ -903,5 +1130,55 @@ mod tests {
     fn rejects_unknown_ui_resource() {
         let error = read_resource(&json!({"uri": "ui://local-mcp/unknown.html"})).unwrap_err();
         assert!(error.to_string().contains("unknown resource"));
+    }
+
+    #[test]
+    fn heartbeat_tools_are_declared() {
+        let tools = tools();
+        for name in [
+            "heartbeat_start",
+            "heartbeat_wait",
+            "heartbeat_status",
+            "heartbeat_stop",
+        ] {
+            assert!(
+                tools
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == name),
+                "missing tool {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn heartbeat_skips_ticks_missed_while_agent_is_busy() {
+        let start = Instant::now();
+        let interval = Duration::from_secs(300);
+        let mut heartbeat = Heartbeat::new(interval, start, 1);
+
+        // The 5-minute tick was delivered while the agent was waiting.
+        heartbeat.delivered_ticks += 1;
+        heartbeat.next_tick += interval;
+
+        // The work triggered at 5 minutes runs until 12 minutes. The 10-minute
+        // tick must be skipped instead of being queued for immediate delivery.
+        let missed = skip_missed_heartbeat_ticks(&mut heartbeat, start + Duration::from_secs(720));
+        assert_eq!(missed, 1);
+        assert_eq!(heartbeat.skipped_ticks, 1);
+        assert_eq!(heartbeat.delivered_ticks, 1);
+        assert_eq!(heartbeat.next_tick, start + Duration::from_secs(900));
+    }
+
+    #[test]
+    fn heartbeat_skips_multiple_overdue_ticks_without_catching_up() {
+        let start = Instant::now();
+        let mut heartbeat = Heartbeat::new(Duration::from_secs(60), start, 1);
+
+        let missed = skip_missed_heartbeat_ticks(&mut heartbeat, start + Duration::from_secs(305));
+        assert_eq!(missed, 5);
+        assert_eq!(heartbeat.skipped_ticks, 5);
+        assert_eq!(heartbeat.next_tick, start + Duration::from_secs(360));
     }
 }

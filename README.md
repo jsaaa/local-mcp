@@ -62,6 +62,22 @@ sessions.
 `get_image` returns PNG, JPEG, GIF, WebP, BMP, TIFF, and AVIF files as native MCP
 image content. Relative image paths are resolved from the session working directory.
 
+For long-running ChatGPT Web turns, `heartbeat_start` and `heartbeat_wait` provide
+an in-turn heartbeat similar to a `/heartbeat every 5m` loop. Start a schedule,
+then call `heartbeat_wait` repeatedly while idle. The wait call uses short long-poll
+chunks (at most 25 seconds) so the agent should immediately call it again when it
+returns `status: "waiting"`. A scheduled tick is delivered only when
+`heartbeat_wait` is actively waiting. If the agent is still doing work when a tick
+passes, that tick is counted as skipped and is not queued for catch-up; the next
+future tick remains scheduled. `heartbeat_status` reports delivered/skipped counts,
+and `heartbeat_stop` removes the schedule.
+
+This heartbeat keeps an already-running ChatGPT turn alive through repeated tool
+calls; MCP does not provide a way for local-mcp to start a new ChatGPT turn after
+that turn has ended. For example, an agent emulating `every 5m` should use
+`interval_seconds: 300`, wait until `status: "tick"`, do one work cycle, and then
+resume calling `heartbeat_wait`.
+
 Each session uses its own local IPC endpoint: an explicitly permission-restricted
 Unix domain socket on Unix, or a named pipe using Windows' default security
 descriptor. Both the MCP server and the start UI block on I/O, so idle operation
