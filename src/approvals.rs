@@ -171,7 +171,7 @@ pub async fn activity(session_id: &str, title: impl Into<String>, detail: Option
     let _ = stream.shutdown().await;
 }
 
-pub async fn start(session_id: Option<&str>) -> Result<()> {
+pub async fn start(session_id: Option<&str>, initial_yolo: bool) -> Result<()> {
     let mut session = config::create_session(&std::env::current_dir()?, session_id).await?;
     let path = config::socket_path(&session.id)?;
     #[cfg(unix)]
@@ -197,7 +197,10 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
 
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut pending = VecDeque::<(Request, SessionStream)>::new();
-    let mut yolo = false;
+    let mut yolo = initial_yolo;
+    if yolo {
+        eprintln!("Permissions: yolo (all unsandboxed calls are allowed for this session)");
+    }
     loop {
         tokio::select! {
             connection = listener.accept() => {

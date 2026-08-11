@@ -24,6 +24,9 @@ local-mcp start
 # Or choose a stable session ID (letters, numbers, "-", "_", and "."):
 local-mcp start my-project
 
+# Start directly in yolo mode when all unsandboxed calls should be allowed:
+local-mcp start my-project --yolo
+
 # Give the printed session ID to the agent in your prompt. The agent includes it
 # in each local-mcp tool call.
 
@@ -53,8 +56,9 @@ there is no separate persistent cwd setting. Sandboxed calls are always allowed
 and have no network access. `without_sandbox`
 runs with the service user's full host permissions and network access, so it asks
 the approvals process before every call. `/permissions yolo` disables those
-prompts only for the lifetime of that session; `/permissions ask`
-turns prompts back on. The singular `/permission ...` spelling is also accepted.
+prompts only for the lifetime of that session; `local-mcp start --yolo` starts in
+the same mode immediately. `/permissions ask` turns prompts back on. The singular
+`/permission ...` spelling is also accepted.
 Every tool takes a `session_id`. The agent can call `session_info` with the ID
 from the prompt to confirm the working directory and sandbox roots. One
 `local-mcp mcp` process can therefore serve multiple independently configured
