@@ -186,6 +186,20 @@ enum Reservation {
     Conflict(WorkflowStepResult),
 }
 
+struct SessionJournalLock {
+    file: File,
+}
+
+impl Drop for SessionJournalLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+struct RunnerLease {
+    _file: File,
+}
+
 fn runner_instance_id() -> &'static str {
     static INSTANCE_ID: OnceLock<String> = OnceLock::new();
     INSTANCE_ID
@@ -196,6 +210,104 @@ fn runner_instance_id() -> &'static str {
 fn journal_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn runner_lease_root() -> Result<PathBuf> {
+    Ok(config::state_dir()?.join("workflow-runners"))
+}
+
+fn runner_lease_path(instance_id: &str) -> Result<PathBuf> {
+    validate_identifier("runner_instance_id", instance_id)?;
+    Ok(runner_lease_root()?.join(format!("{instance_id}.lock")))
+}
+
+fn ensure_runner_lease() -> Result<()> {
+    static LEASE: OnceLock<std::result::Result<RunnerLease, String>> = OnceLock::new();
+    let lease =
+        LEASE.get_or_init(|| initialize_runner_lease().map_err(|error| format!("{error:#}")));
+    match lease {
+        Ok(_) => Ok(()),
+        Err(message) => anyhow::bail!("cannot initialize workflow runner lease: {message}"),
+    }
+}
+
+fn initialize_runner_lease() -> Result<RunnerLease> {
+    let root = runner_lease_root()?;
+    fs::create_dir_all(&root)?;
+    let path = runner_lease_path(runner_instance_id())?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("cannot open workflow runner lease {}", path.display()))?;
+    fs2::FileExt::lock_exclusive(&file)
+        .with_context(|| format!("cannot lock workflow runner lease {}", path.display()))?;
+    Ok(RunnerLease { _file: file })
+}
+
+fn runner_lease_active(instance_id: &str) -> Result<bool> {
+    let path = runner_lease_path(instance_id)?;
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("cannot inspect workflow runner lease {}", path.display())
+            });
+        }
+    };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            let _ = fs2::FileExt::unlock(&file);
+            Ok(false)
+        }
+        Err(error) if lock_is_contended(&error) => Ok(true),
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot inspect workflow runner lease {}", path.display())),
+    }
+}
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_LOCK_VIOLATION, returned by LockFileEx through fs2.
+        return error.raw_os_error() == Some(33);
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn session_journal_lock_path(session_id: &str) -> Result<PathBuf> {
+    Ok(session_root(session_id)?.join(".journal.lock"))
+}
+
+async fn acquire_session_journal_lock(session_id: &str) -> Result<SessionJournalLock> {
+    let path = session_journal_lock_path(session_id)?;
+    tokio::task::spawn_blocking(move || -> Result<SessionJournalLock> {
+        let parent = path
+            .parent()
+            .context("workflow journal lock has no parent")?;
+        fs::create_dir_all(parent)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("cannot open workflow journal lock {}", path.display()))?;
+        fs2::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("cannot lock workflow journal {}", path.display()))?;
+        Ok(SessionJournalLock { file })
+    })
+    .await
+    .context("workflow journal lock task failed")?
 }
 
 pub async fn run(args: &Value, session: &config::Session) -> Result<WorkflowStepResult> {
@@ -218,6 +330,8 @@ enum WorkflowExecutionMode {
     Sandboxed,
     #[cfg(test)]
     Unrestricted,
+    #[cfg(all(windows, not(test)))]
+    Unsupported,
 }
 
 #[cfg(test)]
@@ -237,10 +351,12 @@ async fn run_with_mode(
         "session_id does not match the loaded session"
     );
     validate_args(&args)?;
+    ensure_runner_lease()?;
     let invocation = WorkflowInvocation::from(&args);
 
     let reservation = {
-        let _guard = journal_lock().lock().unwrap();
+        let _session_guard = acquire_session_journal_lock(&session.id).await?;
+        let _process_guard = journal_lock().lock().unwrap();
         reserve_locked(&args, &invocation, session)?
     };
     let record = match reservation {
@@ -250,6 +366,62 @@ async fn run_with_mode(
         Reservation::Launch(record) => record,
     };
 
+    // No await occurs between the durable Running reservation above and this
+    // spawn. Once a command is eligible to start, an owned supervisor therefore
+    // exists before cancellation can drop the MCP call future.
+    let fallback_session = session.clone();
+    let fallback_record = record.clone();
+    let supervisor = tokio::spawn(supervise_reserved_step(
+        args,
+        session.clone(),
+        execution_mode,
+        record,
+    ));
+    match supervisor.await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            let detail = format!("workflow supervisor could not persist completion: {error:#}");
+            let failed = fail_running_step(&fallback_session, &fallback_record, detail).await?;
+            Ok(failed.result(false))
+        }
+        Err(join_error) => {
+            let detail = format!("workflow supervisor failed: {join_error}");
+            let failed = fail_running_step(&fallback_session, &fallback_record, detail).await?;
+            Ok(failed.result(false))
+        }
+    }
+}
+
+async fn supervise_reserved_step(
+    args: WorkflowStepArgs,
+    session: config::Session,
+    execution_mode: WorkflowExecutionMode,
+    record: StepRecord,
+) -> Result<WorkflowStepResult> {
+    let fallback_session = session.clone();
+    let fallback_record = record.clone();
+    let worker = tokio::spawn(execute_reserved_step(args, session, execution_mode, record));
+    match worker.await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            let detail = format!("workflow command worker could not persist completion: {error:#}");
+            let failed = fail_running_step(&fallback_session, &fallback_record, detail).await?;
+            Ok(failed.result(false))
+        }
+        Err(join_error) => {
+            let detail = format!("workflow command worker failed: {join_error}");
+            let failed = fail_running_step(&fallback_session, &fallback_record, detail).await?;
+            Ok(failed.result(false))
+        }
+    }
+}
+
+async fn execute_reserved_step(
+    args: WorkflowStepArgs,
+    session: config::Session,
+    execution_mode: WorkflowExecutionMode,
+    record: StepRecord,
+) -> Result<WorkflowStepResult> {
     let mut roots = session.permitted_directories.clone();
     if !roots.iter().any(|root| session.cwd.starts_with(root)) {
         roots.push(session.cwd.clone());
@@ -263,6 +435,10 @@ async fn run_with_mode(
         WorkflowExecutionMode::Unrestricted => {
             sandbox::run_unrestricted(&args.command, &session.cwd, None).await
         }
+        #[cfg(all(windows, not(test)))]
+        WorkflowExecutionMode::Unsupported => {
+            anyhow::bail!("workflow steps are unsupported on Windows")
+        }
     };
     let missing_expected_outputs = if output.as_ref().is_ok_and(|output| output.status == 0) {
         missing_files(&session.cwd, &args.expected_outputs)
@@ -270,56 +446,94 @@ async fn run_with_mode(
         Vec::new()
     };
 
-    let final_record = {
-        let _guard = journal_lock().lock().unwrap();
-        let mut current = load_required_locked(&session.id, &record.step_id)?;
-        anyhow::ensure!(
-            current.idempotency_key == record.idempotency_key
-                && current.invocation == record.invocation,
-            "workflow step journal changed while the command was running"
-        );
-        anyhow::ensure!(
-            current.status == StepStatus::Running,
-            "workflow step is no longer running"
-        );
-        let now = now_ms();
-        current.updated_at_ms = now;
-        current.finished_at_ms = Some(now);
-        match output {
-            Ok(output) => {
-                current.exit_code = Some(output.status);
-                current.stdout = output.stdout;
-                current.stderr = output.stderr;
-                if output.status != 0 {
-                    current.status = StepStatus::Failed;
-                    current.error = Some(format!("command exited with status {}", output.status));
-                } else if !missing_expected_outputs.is_empty() {
-                    current.status = StepStatus::Failed;
-                    current.missing_expected_outputs = missing_expected_outputs;
-                    current.error = Some(
-                        "command exited successfully but expected outputs were not created"
-                            .to_owned(),
-                    );
-                } else {
-                    current.status = StepStatus::Succeeded;
-                    current.error = None;
-                }
-            }
-            Err(error) => {
+    let final_record =
+        finalize_running_step(&session, &record, output, missing_expected_outputs).await?;
+    Ok(final_record.result(false))
+}
+
+async fn finalize_running_step(
+    session: &config::Session,
+    reserved: &StepRecord,
+    output: Result<sandbox::Output>,
+    missing_expected_outputs: Vec<String>,
+) -> Result<StepRecord> {
+    let _session_guard = acquire_session_journal_lock(&session.id).await?;
+    let _process_guard = journal_lock().lock().unwrap();
+    let mut current = load_required_locked(&session.id, &reserved.step_id)?;
+    ensure_same_reservation(&current, reserved)?;
+    if current.status != StepStatus::Running {
+        return Ok(current);
+    }
+
+    let now = now_ms();
+    current.updated_at_ms = now;
+    current.finished_at_ms = Some(now);
+    match output {
+        Ok(output) => {
+            current.exit_code = Some(output.status);
+            current.stdout = output.stdout;
+            current.stderr = output.stderr;
+            if output.status != 0 {
                 current.status = StepStatus::Failed;
-                current.error = Some(format!("command could not be executed: {error:#}"));
+                current.error = Some(format!("command exited with status {}", output.status));
+            } else if !missing_expected_outputs.is_empty() {
+                current.status = StepStatus::Failed;
+                current.missing_expected_outputs = missing_expected_outputs;
+                current.error = Some(
+                    "command exited successfully but expected outputs were not created".to_owned(),
+                );
+            } else {
+                current.status = StepStatus::Succeeded;
+                current.error = None;
             }
         }
-        current.history.push(StepTransition {
-            status: current.status,
-            at_ms: now,
-            detail: current.error.clone(),
-        });
-        publish_locked(&current)?;
-        current
-    };
+        Err(error) => {
+            current.status = StepStatus::Failed;
+            current.error = Some(format!("command could not be executed: {error:#}"));
+        }
+    }
+    current.history.push(StepTransition {
+        status: current.status,
+        at_ms: now,
+        detail: current.error.clone(),
+    });
+    publish_locked(&current)?;
+    Ok(current)
+}
 
-    Ok(final_record.result(false))
+async fn fail_running_step(
+    session: &config::Session,
+    reserved: &StepRecord,
+    detail: String,
+) -> Result<StepRecord> {
+    let _session_guard = acquire_session_journal_lock(&session.id).await?;
+    let _process_guard = journal_lock().lock().unwrap();
+    let mut current = load_required_locked(&session.id, &reserved.step_id)?;
+    ensure_same_reservation(&current, reserved)?;
+    if current.status != StepStatus::Running {
+        return Ok(current);
+    }
+    let now = now_ms();
+    current.status = StepStatus::Failed;
+    current.updated_at_ms = now;
+    current.finished_at_ms = Some(now);
+    current.error = Some(detail);
+    current.history.push(StepTransition {
+        status: StepStatus::Failed,
+        at_ms: now,
+        detail: current.error.clone(),
+    });
+    publish_locked(&current)?;
+    Ok(current)
+}
+
+fn ensure_same_reservation(current: &StepRecord, reserved: &StepRecord) -> Result<()> {
+    anyhow::ensure!(
+        current.idempotency_key == reserved.idempotency_key
+            && current.invocation == reserved.invocation,
+        "workflow step journal changed while the command was running"
+    );
+    Ok(())
 }
 
 fn reserve_locked(
@@ -330,63 +544,98 @@ fn reserve_locked(
     cleanup_temporary_files_locked(&session.id)?;
 
     if let Some(existing) = find_by_idempotency_locked(&session.id, &args.idempotency_key)? {
-        if existing.invocation == *invocation {
+        if existing.invocation != *invocation {
+            return Ok(Reservation::Conflict(WorkflowStepResult::conflict(
+                args,
+                format!(
+                    "idempotency key {:?} already belongs to step {:?} with a different invocation",
+                    args.idempotency_key, existing.step_id
+                ),
+            )));
+        }
+        if existing.status != StepStatus::Blocked {
             return Ok(Reservation::Reused(existing));
         }
-        return Ok(Reservation::Conflict(WorkflowStepResult::conflict(
-            args,
-            format!(
-                "idempotency key {:?} already belongs to step {:?} with a different invocation",
-                args.idempotency_key, existing.step_id
-            ),
-        )));
+        return reserve_attempt_locked(args, invocation, session, Some(existing));
     }
 
     if let Some(existing) = load_optional_locked(&session.id, &args.step_id)? {
-        return Ok(Reservation::Conflict(WorkflowStepResult::conflict(
-            args,
-            format!(
-                "step_id {:?} already exists with idempotency key {:?}",
-                args.step_id, existing.idempotency_key
-            ),
-        )));
+        if existing.status != StepStatus::Blocked {
+            return Ok(Reservation::Conflict(WorkflowStepResult::conflict(
+                args,
+                format!(
+                    "step_id {:?} already exists with idempotency key {:?}",
+                    args.step_id, existing.idempotency_key
+                ),
+            )));
+        }
+        // A blocked attempt has produced no command side effect. A new key may
+        // replace that attempt so changed gates/invocation can be retried.
+        return reserve_attempt_locked(args, invocation, session, Some(existing));
     }
 
-    let mut blocked_by = Vec::new();
-    for dependency in &args.depends_on {
-        match load_optional_locked(&session.id, dependency)? {
-            None => blocked_by.push(format!("{dependency}: missing")),
-            Some(record) if dependency_satisfied(&record) => {}
-            Some(record) => blocked_by.push(format!("{dependency}: {}", record.status.as_str())),
-        }
-    }
-    let missing_required_files = missing_files(&session.cwd, &args.required_files);
+    reserve_attempt_locked(args, invocation, session, None)
+}
+
+fn reserve_attempt_locked(
+    args: &WorkflowStepArgs,
+    invocation: &WorkflowInvocation,
+    session: &config::Session,
+    existing: Option<StepRecord>,
+) -> Result<Reservation> {
     let now = now_ms();
-    let mut record = StepRecord {
-        version: WORKFLOW_SCHEMA_VERSION,
-        session_id: session.id.clone(),
-        step_id: args.step_id.clone(),
-        idempotency_key: args.idempotency_key.clone(),
-        invocation: invocation.clone(),
-        runner_instance_id: runner_instance_id().to_owned(),
-        status: StepStatus::Pending,
-        continue_on_error: args.continue_on_error,
-        created_at_ms: now,
-        updated_at_ms: now,
-        finished_at_ms: None,
-        exit_code: None,
-        stdout: String::new(),
-        stderr: String::new(),
-        error: None,
-        blocked_by,
-        missing_required_files,
-        missing_expected_outputs: Vec::new(),
-        history: vec![StepTransition {
+    let blocked_by = unsatisfied_dependencies_locked(&session.id, &args.depends_on)?;
+    let missing_required_files = missing_files(&session.cwd, &args.required_files);
+    let mut record = if let Some(mut record) = existing {
+        record.idempotency_key = args.idempotency_key.clone();
+        record.invocation = invocation.clone();
+        record.runner_instance_id = runner_instance_id().to_owned();
+        record.status = StepStatus::Pending;
+        record.continue_on_error = args.continue_on_error;
+        record.updated_at_ms = now;
+        record.finished_at_ms = None;
+        record.exit_code = None;
+        record.stdout.clear();
+        record.stderr.clear();
+        record.error = None;
+        record.blocked_by.clear();
+        record.missing_required_files.clear();
+        record.missing_expected_outputs.clear();
+        record.history.push(StepTransition {
             status: StepStatus::Pending,
             at_ms: now,
-            detail: None,
-        }],
+            detail: Some("retrying previously blocked workflow step".to_owned()),
+        });
+        record
+    } else {
+        StepRecord {
+            version: WORKFLOW_SCHEMA_VERSION,
+            session_id: session.id.clone(),
+            step_id: args.step_id.clone(),
+            idempotency_key: args.idempotency_key.clone(),
+            invocation: invocation.clone(),
+            runner_instance_id: runner_instance_id().to_owned(),
+            status: StepStatus::Pending,
+            continue_on_error: args.continue_on_error,
+            created_at_ms: now,
+            updated_at_ms: now,
+            finished_at_ms: None,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+            blocked_by: Vec::new(),
+            missing_required_files: Vec::new(),
+            missing_expected_outputs: Vec::new(),
+            history: vec![StepTransition {
+                status: StepStatus::Pending,
+                at_ms: now,
+                detail: None,
+            }],
+        }
     };
+    record.blocked_by = blocked_by;
+    record.missing_required_files = missing_required_files;
 
     if !record.blocked_by.is_empty() || !record.missing_required_files.is_empty() {
         record.status = StepStatus::Blocked;
@@ -401,9 +650,9 @@ fn reserve_locked(
         return Ok(Reservation::Blocked(record));
     }
 
-    // Publish pending and then running before releasing the reservation lock.
-    // A concurrent retry can therefore observe and reuse the reservation, and
-    // no process starts unless the running state was durably published.
+    // Publish pending and then running before releasing both reservation locks.
+    // A process in this or another local-mcp instance can therefore never start
+    // the same idempotency key without observing this durable reservation.
     publish_locked(&record)?;
     record.status = StepStatus::Running;
     record.updated_at_ms = now_ms();
@@ -414,6 +663,21 @@ fn reserve_locked(
     });
     publish_locked(&record)?;
     Ok(Reservation::Launch(record))
+}
+
+fn unsatisfied_dependencies_locked(
+    session_id: &str,
+    dependencies: &[String],
+) -> Result<Vec<String>> {
+    let mut blocked_by = Vec::new();
+    for dependency in dependencies {
+        match load_optional_locked(session_id, dependency)? {
+            None => blocked_by.push(format!("{dependency}: missing")),
+            Some(record) if dependency_satisfied(&record) => {}
+            Some(record) => blocked_by.push(format!("{dependency}: {}", record.status.as_str())),
+        }
+    }
+    Ok(blocked_by)
 }
 
 fn dependency_satisfied(record: &StepRecord) -> bool {
@@ -596,6 +860,7 @@ fn load_optional_locked(session_id: &str, step_id: &str) -> Result<Option<StepRe
     anyhow::ensure!(record.step_id == step_id, "workflow step ID mismatch");
     if matches!(record.status, StepStatus::Pending | StepStatus::Running)
         && record.runner_instance_id != runner_instance_id()
+        && !runner_lease_active(&record.runner_instance_id)?
     {
         let mut record = record;
         let now = now_ms();
@@ -719,6 +984,30 @@ mod tests {
         })
     }
 
+    async fn wait_for_file(path: &Path) {
+        for _ in 0..400 {
+            if path.is_file() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("file was not created: {}", path.display());
+    }
+
+    async fn wait_for_terminal_result(
+        request: &Value,
+        session: &config::Session,
+    ) -> WorkflowStepResult {
+        for _ in 0..400 {
+            let result = run_for_tests(request, session).await.unwrap();
+            if result.status != StepStatus::Running {
+                return result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("workflow step remained running");
+    }
+
     #[cfg(unix)]
     fn successful_command() -> Vec<String> {
         vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()]
@@ -834,6 +1123,178 @@ mod tests {
         assert_eq!(result.status, StepStatus::Blocked);
         assert_eq!(result.missing_required_files, vec!["missing.ok"]);
         assert!(!marker.exists());
+        remove_session_for_tests(&session.id);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_the_mcp_call_does_not_strand_a_running_step() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-workflow-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = session(&directory);
+        let started = directory.join("started");
+        let completed = directory.join("completed");
+        let count = directory.join("count");
+        let request = args(
+            &session,
+            "cancellation-safe",
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!(
+                    "printf 'run\\n' >> '{}'; : > '{}'; sleep 0.2; : > '{}'",
+                    count.display(),
+                    started.display(),
+                    completed.display()
+                ),
+            ],
+        );
+
+        let task_request = request.clone();
+        let task_session = session.clone();
+        let call = tokio::spawn(async move { run_for_tests(&task_request, &task_session).await });
+        wait_for_file(&started).await;
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+
+        wait_for_file(&completed).await;
+        let result = wait_for_terminal_result(&request, &session).await;
+        assert_eq!(result.status, StepStatus::Succeeded);
+        assert!(result.reused);
+        let runs = tokio::fs::read_to_string(&count).await.unwrap();
+        assert_eq!(runs.lines().count(), 1);
+
+        remove_session_for_tests(&session.id);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_step_rechecks_dependencies_with_the_same_key() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-workflow-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = session(&directory);
+        let marker = directory.join("dependent-ran");
+        let mut dependent = args(&session, "retry-dependent", write_command(&marker, false));
+        dependent["depends_on"] = serde_json::json!(["retry-prerequisite"]);
+
+        let blocked = run_for_tests(&dependent, &session).await.unwrap();
+        assert_eq!(blocked.status, StepStatus::Blocked);
+        assert!(!marker.exists());
+
+        let prerequisite = args(&session, "retry-prerequisite", successful_command());
+        assert_eq!(
+            run_for_tests(&prerequisite, &session).await.unwrap().status,
+            StepStatus::Succeeded
+        );
+
+        let retried = run_for_tests(&dependent, &session).await.unwrap();
+        assert_eq!(retried.status, StepStatus::Succeeded);
+        assert!(marker.is_file());
+        assert_eq!(
+            retried
+                .history
+                .iter()
+                .map(|transition| transition.status)
+                .collect::<Vec<_>>(),
+            vec![
+                StepStatus::Pending,
+                StepStatus::Blocked,
+                StepStatus::Pending,
+                StepStatus::Running,
+                StepStatus::Succeeded,
+            ]
+        );
+
+        remove_session_for_tests(&session.id);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_step_can_be_replaced_by_a_new_key_after_required_file_appears() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-workflow-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = session(&directory);
+        let marker = directory.join("new-key-ran");
+        let gate = directory.join("gate.ok");
+        let mut request = args(&session, "new-key-retry", write_command(&marker, false));
+        request["required_files"] = serde_json::json!(["gate.ok"]);
+
+        let blocked = run_for_tests(&request, &session).await.unwrap();
+        assert_eq!(blocked.status, StepStatus::Blocked);
+        tokio::fs::write(&gate, b"ok").await.unwrap();
+        request["idempotency_key"] = Value::String("new-key-retry-v2".to_owned());
+
+        let retried = run_for_tests(&request, &session).await.unwrap();
+        assert_eq!(retried.status, StepStatus::Succeeded);
+        assert_eq!(retried.idempotency_key, "new-key-retry-v2");
+        assert!(marker.is_file());
+
+        remove_session_for_tests(&session.id);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_waits_for_an_external_process_journal_lock() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-workflow-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = session(&directory);
+        let lock_path = session_journal_lock_path(&session.id).unwrap();
+        tokio::fs::create_dir_all(lock_path.parent().unwrap())
+            .await
+            .unwrap();
+        let ready = directory.join("lock-ready");
+        let release = directory.join("lock-release");
+        let marker = directory.join("command-ran");
+        let script = r#"
+import fcntl
+import pathlib
+import sys
+import time
+
+lock_path, ready_path, release_path = map(pathlib.Path, sys.argv[1:])
+with lock_path.open("a+") as lock_file:
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    ready_path.write_text("ready")
+    while not release_path.exists():
+        time.sleep(0.01)
+"#;
+        let mut lock_holder = tokio::process::Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(&lock_path)
+            .arg(&ready)
+            .arg(&release)
+            .spawn()
+            .expect("python3 is required for the Unix cross-process lock test");
+        wait_for_file(&ready).await;
+
+        let request = args(
+            &session,
+            "cross-process-reservation",
+            write_command(&marker, false),
+        );
+        let task_request = request.clone();
+        let task_session = session.clone();
+        let call = tokio::spawn(async move { run_for_tests(&task_request, &task_session).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!call.is_finished(), "reservation ignored the external lock");
+        assert!(
+            !marker.exists(),
+            "command started before reservation lock release"
+        );
+
+        tokio::fs::write(&release, b"release").await.unwrap();
+        assert!(lock_holder.wait().await.unwrap().success());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), call)
+            .await
+            .expect("workflow did not continue after lock release")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, StepStatus::Succeeded);
+        assert!(marker.is_file());
+
         remove_session_for_tests(&session.id);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -966,6 +1427,61 @@ mod tests {
 
         remove_session_for_tests(&session.id);
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[test]
+    fn active_foreign_runner_is_not_recovered_until_its_lease_is_released() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-workflow-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let session = session(&directory);
+        let request: WorkflowStepArgs =
+            serde_json::from_value(args(&session, "foreign-runner-step", successful_command()))
+                .unwrap();
+        let invocation = WorkflowInvocation::from(&request);
+        let _process_guard = journal_lock().lock().unwrap();
+        let Reservation::Launch(mut record) =
+            reserve_locked(&request, &invocation, &session).unwrap()
+        else {
+            panic!("expected launch reservation");
+        };
+        let foreign_runner = Uuid::new_v4().to_string();
+        let lease_path = runner_lease_path(&foreign_runner).unwrap();
+        fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+        let lease = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lease_path)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lease).unwrap();
+        record.runner_instance_id = foreign_runner;
+        publish_locked(&record).unwrap();
+
+        let active = load_required_locked(&session.id, "foreign-runner-step").unwrap();
+        assert_eq!(active.status, StepStatus::Running);
+        fs2::FileExt::unlock(&lease).unwrap();
+        drop(lease);
+        let recovered = load_required_locked(&session.id, "foreign-runner-step").unwrap();
+        assert_eq!(recovered.status, StepStatus::Failed);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("runner restarted")
+        );
+
+        drop(_process_guard);
+        remove_session_for_tests(&session.id);
+        fs::remove_dir_all(directory).unwrap();
+        let _ = fs::remove_file(lease_path);
+    }
+
+    #[test]
+    fn current_runner_lease_is_detected_as_active() {
+        ensure_runner_lease().unwrap();
+        assert!(runner_lease_active(runner_instance_id()).unwrap());
     }
 
     #[test]

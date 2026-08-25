@@ -109,18 +109,28 @@ process is spawned, local-mcp atomically reserves the idempotency key, persists
 
 The journal is scoped by `session_id` and stores one atomically published,
 versioned snapshot per `step_id`, including the transition history and command
-result. Status values are `pending`, `running`, `succeeded`, `failed`, and
-`blocked`. A missing, running, blocked, or failed dependency blocks downstream
-execution by default. `continue_on_error: true` on the failed prerequisite is the
-explicit opt-out that permits its dependents to proceed. A journal entry left
-`pending` or `running` by a previous local-mcp process is recovered as `failed`;
-the server never assumes the old command is still running.
+result. Reservation and terminal updates hold both a process-local mutex and an
+OS file lock, so multiple local-mcp server processes cannot reserve the same
+idempotency key concurrently. Each live server also holds a runner lease: a
+`pending` or `running` record is recovered as `failed` only after its owning
+runner lease is no longer active, rather than merely because another server
+instance observed it.
 
-An exact retry with the same `idempotency_key` and invocation returns the prior
-result with `reused: true` and does not run another process. Reusing a key for a
-different invocation, or reusing a `step_id` with another key, returns a
-deterministic `blocked` conflict. Use a new key after intentionally changing the
-command, dependencies, artifacts, or continuation policy.
+Status values are `pending`, `running`, `succeeded`, `failed`, and `blocked`. A
+missing, running, blocked, or failed dependency blocks downstream execution by
+default. `continue_on_error: true` on the failed prerequisite is the explicit
+opt-out that permits its dependents to proceed. `blocked` is retryable because no
+command was spawned: each retry rechecks dependencies and required files. The
+same key may be retried with the same invocation, or a new key may replace the
+blocked attempt when the invocation or gates intentionally changed.
+
+Once a step is durably recorded as `running`, command execution belongs to an
+independent supervisor task. Cancelling the MCP call only detaches the caller;
+the supervisor still records `succeeded` or `failed`. A retry while it is active
+returns the persisted `running` record, and a later exact retry returns the
+terminal result with `reused: true` without running a second process. Reusing a
+non-blocked key for a different invocation, or a non-blocked `step_id` with
+another key, remains a deterministic `blocked` conflict.
 
 A complete edit → focused test → acceptance sequence can look like this. First,
 edit the source with `write_file` or `edit_file`:
