@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{approvals, config, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const REGISTERED_JOB_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const HEARTBEAT_DEFAULT_NAME: &str = "default";
 const HEARTBEAT_MAX_WAIT: Duration = Duration::from_secs(25);
 const HEARTBEAT_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -149,6 +150,39 @@ struct Job {
     session_id: String,
     command: String,
     handle: JoinHandle<Result<String>>,
+}
+
+struct RegisteredJobGuard {
+    job_id: Uuid,
+    armed: bool,
+}
+
+impl RegisteredJobGuard {
+    fn new(job_id: Uuid) -> Self {
+        Self {
+            job_id,
+            armed: true,
+        }
+    }
+
+    fn id(&self) -> Uuid {
+        self.job_id
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RegisteredJobGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(job) = jobs().lock().unwrap().remove(&self.job_id) {
+            job.handle.abort();
+        }
+    }
 }
 
 fn jobs() -> &'static Mutex<HashMap<Uuid, Job>> {
@@ -797,15 +831,33 @@ async fn store_job(
     handle: JoinHandle<Result<String>>,
     activity: &str,
 ) -> Result<Value> {
+    let job_id = insert_job(session, rendered_command.clone(), handle);
+    running_job_result(session, &rendered_command, job_id, activity).await
+}
+
+fn insert_job(
+    session: &config::Session,
+    rendered_command: String,
+    handle: JoinHandle<Result<String>>,
+) -> Uuid {
     let job_id = Uuid::new_v4();
     jobs().lock().unwrap().insert(
         job_id,
         Job {
             session_id: session.id.clone(),
-            command: rendered_command.clone(),
+            command: rendered_command,
             handle,
         },
     );
+    job_id
+}
+
+async fn running_job_result(
+    session: &config::Session,
+    rendered_command: &str,
+    job_id: Uuid,
+    activity: &str,
+) -> Result<Value> {
     approvals::activity(
         &session.id,
         format!("{activity} {rendered_command}"),
@@ -887,26 +939,41 @@ async fn without_sandbox_with_timeout(
     session: &config::Session,
     foreground_timeout: Duration,
 ) -> Result<Value> {
-    let (rendered_command, mut handle) =
-        spawn_unrestricted_command("without_sandbox", args, session).await?;
+    let (mut registration, rendered_command) =
+        spawn_unrestricted_job("without_sandbox", args, session).await?;
+    let job_id = registration.id();
 
-    match tokio::time::timeout(foreground_timeout, &mut handle).await {
-        Ok(joined) => text_result(joined.context("unrestricted command task failed")??),
-        Err(_) => store_job(session, rendered_command, handle, "Backgrounded").await,
+    match wait_for_registered_job(job_id, session, foreground_timeout).await? {
+        Some(result) => {
+            registration.disarm();
+            text_result(result)
+        }
+        None => {
+            let result =
+                running_job_result(session, &rendered_command, job_id, "Backgrounded").await;
+            if result.is_ok() {
+                registration.disarm();
+            }
+            result
+        }
     }
 }
 
 async fn start_without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, handle) =
-        spawn_unrestricted_command("start_without_sandbox", args, session).await?;
-    store_job(session, rendered_command, handle, "Started").await
+    let (mut registration, rendered_command) =
+        spawn_unrestricted_job("start_without_sandbox", args, session).await?;
+    let result = running_job_result(session, &rendered_command, registration.id(), "Started").await;
+    if result.is_ok() {
+        registration.disarm();
+    }
+    result
 }
 
-async fn spawn_unrestricted_command(
+async fn spawn_unrestricted_job(
     operation: &str,
     args: &Value,
     session: &config::Session,
-) -> Result<(String, JoinHandle<Result<String>>)> {
+) -> Result<(RegisteredJobGuard, String)> {
     let command = required_command(args)?;
     let cwd = cwd(args, &session.cwd)?;
     if !approvals::request(
@@ -931,7 +998,56 @@ async fn spawn_unrestricted_command(
         report_command_finished(session_id, &task_command, &result).await;
         result
     });
-    Ok((rendered_command, handle))
+
+    // There is deliberately no await between spawning and registration. Once
+    // the host process can start, cancellation of the MCP call must leave a
+    // session-owned job that poll_job/stop_job can still reach.
+    let job_id = insert_job(session, rendered_command.clone(), handle);
+    Ok((RegisteredJobGuard::new(job_id), rendered_command))
+}
+
+async fn wait_for_registered_job(
+    job_id: Uuid,
+    session: &config::Session,
+    foreground_timeout: Duration,
+) -> Result<Option<String>> {
+    let wait_until_finished = async {
+        loop {
+            let finished = {
+                let all_jobs = jobs().lock().unwrap();
+                let job = all_jobs.get(&job_id).context("unknown job_id")?;
+                anyhow::ensure!(
+                    job.session_id == session.id,
+                    "job does not belong to this session"
+                );
+                job.handle.is_finished()
+            };
+            if finished {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(REGISTERED_JOB_WAIT_POLL_INTERVAL).await;
+        }
+    };
+
+    match tokio::time::timeout(foreground_timeout, wait_until_finished).await {
+        Ok(result) => result?,
+        Err(_) => return Ok(None),
+    }
+
+    let job = {
+        let mut all_jobs = jobs().lock().unwrap();
+        let job = all_jobs.get(&job_id).context("unknown job_id")?;
+        anyhow::ensure!(
+            job.session_id == session.id,
+            "job does not belong to this session"
+        );
+        all_jobs.remove(&job_id).unwrap()
+    };
+    let result = job
+        .handle
+        .await
+        .context("unrestricted command task failed")??;
+    Ok(Some(result))
 }
 
 fn render_command(command: &[String]) -> String {
@@ -1321,6 +1437,62 @@ mod tests {
                 .contains("\"exit_code\":0")
         );
         assert!(directory.join("auto.txt").is_file());
+        let _ = tokio::fs::remove_file(config::socket_path(&session.id).unwrap()).await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_foreground_call_terminates_the_registered_unrestricted_job() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-unrestricted-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let started = directory.join("cancel-started.txt");
+        let completed = directory.join("cancel-completed.txt");
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "without_sandbox", "allow").await;
+
+        let call_session = session.clone();
+        let command = json!({
+            "command": [
+                "sh",
+                "-c",
+                format!(
+                    "printf started > {}; sleep 0.5; printf completed > {}",
+                    started.display(),
+                    completed.display()
+                )
+            ]
+        });
+        let call = tokio::spawn(async move {
+            without_sandbox_with_timeout(&command, &call_session, Duration::from_secs(5)).await
+        });
+        responder.await.unwrap();
+
+        for _ in 0..100 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.exists(), "the unrestricted process never started");
+        call.abort();
+        let _ = call.await;
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !completed.exists(),
+            "cancelling before a job_id response must terminate the command"
+        );
+        let matching_jobs = jobs()
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|job| job.session_id == session.id)
+            .count();
+        assert_eq!(matching_jobs, 0, "cancelled call leaked a registered job");
+
         let _ = tokio::fs::remove_file(config::socket_path(&session.id).unwrap()).await;
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

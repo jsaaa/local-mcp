@@ -100,7 +100,10 @@ approval before launching, returns a normal result within 30 seconds, and
 automatically returns a `job_id` if the approved process is still running.
 `start_without_sandbox` requests approval and then starts the unrestricted job in
 the background immediately. Approval is always completed before process spawn;
-a denied request creates no process and no job. Both kinds of unrestricted jobs
+immediately after spawn the process is registered as a session-owned job before any foreground
+wait begins. If the MCP call is cancelled before a `job_id` response is delivered, that registered
+job is removed and its command task is aborted, so no untracked host process remains. A denied
+request creates no process and no job. Both kinds of unrestricted jobs
 remain owned by the originating session and are polled or stopped with the same
 `poll_job` and `stop_job` tools. Yolo mode skips the prompt but does not change
 job behavior or session ownership. Unrestricted background jobs retain the
