@@ -86,8 +86,8 @@ resume calling `heartbeat_wait`.
 
 The server's `initialize` response includes concise execution rules so MCP clients
 receive the same guidance even when no external system prompt is installed. These
-rules are advisory; they reduce accidental sequencing mistakes but do not replace
-server-side sandboxing, approval checks, or explicit artifact gates.
+rules are advisory. This release enforces only the sandbox and approval checks
+described by each tool; it does not provide a general server-side artifact gate.
 
 Use direct argv arrays for ordinary commands:
 
@@ -106,7 +106,9 @@ invoke the platform shell explicitly in argv and keep the script bounded and
 reviewable. Prefer a checked-in script for substantial workflows.
 
 For work likely to exceed the 30-second foreground timeout, use `start_command`
-and poll with short `poll_job` calls. Do not start a command whose only purpose is
+and poll with short `poll_job` calls. On Linux and macOS this execution is
+sandboxed; on Windows it is approved direct host execution. On Linux and macOS this execution is
+sandboxed; on Windows it is approved direct host execution. Do not start a command whose only purpose is
 to sleep before polling. After a schema error, tool error, or non-zero process
 exit, inspect the failure and stop dependent stages. A stage is successful only
 when the process exits with status zero **and** every required artifact exists.

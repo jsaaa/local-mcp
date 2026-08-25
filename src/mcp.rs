@@ -23,13 +23,13 @@ const INITIALIZE_INSTRUCTIONS: &str = r#"Every tool call requires the local-mcp 
 
 Reliable execution rules:
 - Pass direct commands as argv arrays, for example command: ["cargo", "test"]. Do not pass a shell program string as command. This release has no dedicated shell-program tool; when shell syntax is unavoidable, invoke the platform shell explicitly as argv.
-- Use start_command for sandboxed work likely to exceed the 30-second foreground timeout, then poll with short poll_job calls instead of sleeping in a command.
+- Use start_command for work likely to exceed the 30-second foreground timeout, then poll with short poll_job calls instead of sleeping in a command. On Linux and macOS it is sandboxed; on Windows it is approved direct host execution.
 - After a schema error, tool error, or non-zero process exit, inspect the failure and do not run dependent stages.
 - Treat a stage as successful only when its exit status is zero and every required artifact actually exists.
 - Keep large logs in files and read bounded tails rather than returning unbounded output.
 - Run one checked stage at a time for destructive or real-system workflows.
 
-These instructions are advisory and do not replace server-side sandbox, approval, or artifact gates."#;
+These instructions are advisory. This release enforces only the sandbox and approval checks described by each tool; it does not provide a general server-side artifact gate."#;
 const IMAGE_VIEWER_HTML: &str = r#"<!doctype html>
 <html>
 <head>
@@ -1218,6 +1218,13 @@ mod tests {
         assert!(description("execute").contains("command: [\"cargo\", \"test\"]"));
         assert!(description("execute").contains("dependent stages"));
         assert!(description("start_command").contains("likely to exceed 30 seconds"));
+        assert!(
+            INITIALIZE_INSTRUCTIONS.contains("on Windows it is approved direct host execution")
+        );
+        assert!(
+            INITIALIZE_INSTRUCTIONS
+                .contains("does not provide a general server-side artifact gate")
+        );
         assert!(description("poll_job").contains("short MCP calls"));
         assert!(description("without_sandbox").contains("command: [\"git\", \"status\"]"));
     }
