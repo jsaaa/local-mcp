@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::{approvals, config, sandbox};
+use crate::{approvals, config, sandbox, workflow};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const HEARTBEAT_DEFAULT_NAME: &str = "default";
@@ -302,6 +302,10 @@ fn tools() -> Value {
     let start_command_description = "Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required.";
     #[cfg(windows)]
     let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
+    #[cfg(not(windows))]
+    let workflow_description = "Run one fail-closed sandboxed argv workflow step. The server persists pending/running/terminal state, verifies dependencies and required files before spawn, verifies expected output files after success, and reuses matching idempotency keys.";
+    #[cfg(windows)]
+    let workflow_description = "Fail closed without starting a process: run_workflow_step is unsupported on Windows because this release cannot provide its required filesystem/network sandbox.";
 
     let mut tools = json!([
         {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
@@ -311,6 +315,7 @@ fn tools() -> Value {
         {"name":"write_file","description":write_file_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
         {"name":"execute","description":execute_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
+        {"name":"run_workflow_step","description":workflow_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"step_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._-]+$"},"depends_on":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._-]+$"},"maxItems":128,"uniqueItems":true,"default":[]},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._-]+$"},"required_files":{"type":"array","items":{"type":"string","minLength":1},"maxItems":256,"uniqueItems":true,"default":[]},"expected_outputs":{"type":"array","items":{"type":"string","minLength":1},"maxItems":256,"uniqueItems":true,"default":[]},"command":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":4096},"continue_on_error":{"type":"boolean","default":false}},"required":["session_id","step_id","idempotency_key","command"],"additionalProperties":false}},
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"heartbeat_start","description":"Start or reset an in-turn heartbeat schedule for this local-mcp session. After starting it, call heartbeat_wait repeatedly. A tick is delivered only while heartbeat_wait is actively waiting; ticks that occur while the agent is busy doing work are skipped instead of queued.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"interval_seconds":{"type":"integer","minimum":1,"maximum":86400},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id","interval_seconds"],"additionalProperties":false}},
@@ -384,6 +389,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
         "write_file" => write_file(&args, &session).await,
         "execute" => execute(&args, &session).await,
         "start_command" => start_command(&args, &session).await,
+        "run_workflow_step" => run_workflow_step(&args, &session).await,
         "poll_job" => poll_job(&args, &session).await,
         "stop_job" => stop_job(&args, &session).await,
         "heartbeat_start" => heartbeat_start(&args, &session).await,
@@ -734,6 +740,22 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
     };
     approvals::activity(&session.id, title, detail).await;
     text_result(result?)
+}
+
+async fn run_workflow_step(args: &Value, session: &config::Session) -> Result<Value> {
+    let result = workflow::run(args, session).await?;
+    let detail = result.error.as_deref().map(|error| format!("└ {error}"));
+    approvals::activity(
+        &session.id,
+        format!(
+            "Workflow step {}: {}",
+            result.step_id,
+            result.status.as_str()
+        ),
+        detail,
+    )
+    .await;
+    text_result(serde_json::to_string_pretty(&result)?)
 }
 
 async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
@@ -1130,6 +1152,61 @@ mod tests {
     fn rejects_unknown_ui_resource() {
         let error = read_resource(&json!({"uri": "ui://local-mcp/unknown.html"})).unwrap_err();
         assert!(error.to_string().contains("unknown resource"));
+    }
+
+    #[test]
+    fn workflow_tool_declares_fail_closed_schema() {
+        let tools = tools();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "run_workflow_step")
+            .unwrap();
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["command"]["type"], "array");
+        assert_eq!(schema["properties"]["command"]["minItems"], 1);
+        assert_eq!(schema["properties"]["depends_on"]["uniqueItems"], true);
+        assert_eq!(schema["properties"]["continue_on_error"]["default"], false);
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("idempotency_key"))
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_handler_blocks_before_any_command_side_effect() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-workflow-handler-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = config::Session {
+            id: format!("workflow-handler-{}", Uuid::new_v4()),
+            cwd: directory.clone(),
+            permitted_directories: vec![directory.clone()],
+        };
+        let marker = directory.join("must-not-exist");
+        let result = run_workflow_step(
+            &json!({
+                "session_id": session.id,
+                "step_id": "acceptance",
+                "depends_on": ["focused-tests"],
+                "idempotency_key": "acceptance-v1",
+                "command": ["definitely-must-not-run", marker.to_string_lossy()]
+            }),
+            &session,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["status"], "blocked");
+        assert!(value["blocked_by"][0].as_str().unwrap().contains("missing"));
+        assert!(!marker.exists());
+        workflow::remove_session_for_tests(&session.id);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[test]

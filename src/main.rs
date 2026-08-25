@@ -2,6 +2,7 @@ mod approvals;
 mod config;
 mod mcp;
 mod sandbox;
+mod workflow;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
