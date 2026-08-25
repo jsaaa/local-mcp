@@ -24,6 +24,9 @@ local-mcp start
 # Or choose a stable session ID (letters, numbers, "-", "_", and "."):
 local-mcp start my-project
 
+# Start directly in yolo mode when all unsandboxed calls should be allowed:
+local-mcp start my-project --yolo
+
 # Give the printed session ID to the agent in your prompt. The agent includes it
 # in each local-mcp tool call.
 
@@ -53,14 +56,31 @@ there is no separate persistent cwd setting. Sandboxed calls are always allowed
 and have no network access. `without_sandbox`
 runs with the service user's full host permissions and network access, so it asks
 the approvals process before every call. `/permissions yolo` disables those
-prompts only for the lifetime of that session; `/permissions ask`
-turns prompts back on. The singular `/permission ...` spelling is also accepted.
+prompts only for the lifetime of that session; `local-mcp start --yolo` starts in
+the same mode immediately. `/permissions ask` turns prompts back on. The singular
+`/permission ...` spelling is also accepted.
 Every tool takes a `session_id`. The agent can call `session_info` with the ID
 from the prompt to confirm the working directory and sandbox roots. One
 `local-mcp mcp` process can therefore serve multiple independently configured
 sessions.
 `get_image` returns PNG, JPEG, GIF, WebP, BMP, TIFF, and AVIF files as native MCP
 image content. Relative image paths are resolved from the session working directory.
+
+For long-running ChatGPT Web turns, `heartbeat_start` and `heartbeat_wait` provide
+an in-turn heartbeat similar to a `/heartbeat every 5m` loop. Start a schedule,
+then call `heartbeat_wait` repeatedly while idle. The wait call uses short long-poll
+chunks (at most 25 seconds) so the agent should immediately call it again when it
+returns `status: "waiting"`. A scheduled tick is delivered only when
+`heartbeat_wait` is actively waiting. If the agent is still doing work when a tick
+passes, that tick is counted as skipped and is not queued for catch-up; the next
+future tick remains scheduled. `heartbeat_status` reports delivered/skipped counts,
+and `heartbeat_stop` removes the schedule.
+
+This heartbeat keeps an already-running ChatGPT turn alive through repeated tool
+calls; MCP does not provide a way for local-mcp to start a new ChatGPT turn after
+that turn has ended. For example, an agent emulating `every 5m` should use
+`interval_seconds: 300`, wait until `status: "tick"`, do one work cycle, and then
+resume calling `heartbeat_wait`.
 
 Each session uses its own local IPC endpoint: an explicitly permission-restricted
 Unix domain socket on Unix, or a named pipe using Windows' default security
