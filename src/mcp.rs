@@ -149,11 +149,66 @@ struct Job {
     session_id: String,
     command: String,
     handle: JoinHandle<Result<String>>,
+    control: sandbox::CommandControl,
+}
+
+#[derive(Clone)]
+enum TerminalOutcome {
+    Success(String),
+    Failure(String),
+}
+
+#[derive(Clone)]
+struct TerminalJob {
+    session_id: String,
+    outcome: TerminalOutcome,
 }
 
 fn jobs() -> &'static Mutex<HashMap<Uuid, Job>> {
     static JOBS: OnceLock<Mutex<HashMap<Uuid, Job>>> = OnceLock::new();
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn terminal_jobs() -> &'static Mutex<HashMap<Uuid, TerminalJob>> {
+    static TERMINAL_JOBS: OnceLock<Mutex<HashMap<Uuid, TerminalJob>>> = OnceLock::new();
+    TERMINAL_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_terminal_job(job_id: Uuid, session_id: &str, result: &Result<String>) {
+    const MAX_TERMINAL_JOBS: usize = 256;
+    let outcome = match result {
+        Ok(text) => TerminalOutcome::Success(text.clone()),
+        Err(error) => TerminalOutcome::Failure(format!("{error:#}")),
+    };
+    let mut terminal = terminal_jobs().lock().unwrap();
+    if terminal.len() >= MAX_TERMINAL_JOBS
+        && !terminal.contains_key(&job_id)
+        && let Some(oldest) = terminal.keys().next().copied()
+    {
+        terminal.remove(&oldest);
+    }
+    terminal.insert(
+        job_id,
+        TerminalJob {
+            session_id: session_id.to_owned(),
+            outcome,
+        },
+    );
+}
+
+fn cached_terminal_result(job_id: Uuid, session_id: &str) -> Result<Option<Value>> {
+    let terminal = terminal_jobs().lock().unwrap();
+    let Some(job) = terminal.get(&job_id) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        job.session_id == session_id,
+        "job does not belong to this session"
+    );
+    match &job.outcome {
+        TerminalOutcome::Success(text) => text_result(text.clone()).map(Some),
+        TerminalOutcome::Failure(error) => anyhow::bail!(error.clone()),
+    }
 }
 
 #[derive(Debug)]
@@ -312,7 +367,7 @@ fn tools() -> Value {
         {"name":"execute","description":execute_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
-        {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"stop_job","description":"Stop a background command returned by execute or start_command. The command's complete process tree receives a graceful stop followed by forced termination after a bounded grace period; repeated calls return the cached terminal result.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"heartbeat_start","description":"Start or reset an in-turn heartbeat schedule for this local-mcp session. After starting it, call heartbeat_wait repeatedly. A tick is delivered only while heartbeat_wait is actively waiting; ticks that occur while the agent is busy doing work are skipped instead of queued.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"interval_seconds":{"type":"integer","minimum":1,"maximum":86400},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id","interval_seconds"],"additionalProperties":false}},
         {"name":"heartbeat_wait","description":"Wait for the next heartbeat tick in short long-poll chunks. Call this repeatedly until status is tick, then do one work cycle and call it again. If a scheduled tick passes while no heartbeat_wait call is active because the agent is still working, that tick is skipped. This does not revive a ChatGPT turn after the turn has ended.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"max_wait_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["session_id"],"additionalProperties":false}},
         {"name":"heartbeat_status","description":"Show the current in-turn heartbeat schedule, delivered tick count, skipped tick count, and time until the next tick.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
@@ -720,6 +775,7 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
             status: 0,
             stdout: String::new(),
             stderr: String::new(),
+            termination: sandbox::Termination::Exited,
         }
     };
     let result = render_output(output);
@@ -737,25 +793,29 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
 }
 
 async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, mut handle) = spawn_sandboxed_command("execute", args, session).await?;
+    let (rendered_command, mut handle, control) =
+        spawn_sandboxed_command("execute", args, session).await?;
 
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
-        Ok(joined) => text_result(joined.context("command task failed")??),
-        Err(_) => store_job(session, rendered_command, handle, "Backgrounded").await,
+        Ok(joined) => {
+            drop(control);
+            text_result(joined.context("command task failed")??)
+        }
+        Err(_) => store_job(session, rendered_command, handle, control, "Backgrounded").await,
     }
 }
 
 async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, handle) =
+    let (rendered_command, handle, control) =
         spawn_sandboxed_command("start_command", args, session).await?;
-    store_job(session, rendered_command, handle, "Started").await
+    store_job(session, rendered_command, handle, control, "Started").await
 }
 
 async fn spawn_sandboxed_command(
     operation: &str,
     args: &Value,
     session: &config::Session,
-) -> Result<(String, JoinHandle<Result<String>>)> {
+) -> Result<(String, JoinHandle<Result<String>>, sandbox::CommandControl)> {
     let command = required_command(args)?;
     let cwd = cwd(args, &session.cwd)?;
     #[cfg(windows)]
@@ -779,20 +839,22 @@ async fn spawn_sandboxed_command(
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
     let session_id = session.id.clone();
     let task_command = rendered_command.clone();
+    let (control, cancellation) = sandbox::command_control();
     let handle = tokio::spawn(async move {
-        let result = sandbox::run(&command, &cwd, &roots, None)
+        let result = sandbox::run_controlled(&command, &cwd, &roots, None, cancellation, None)
             .await
             .and_then(render_output);
         report_command_finished(session_id, &task_command, &result).await;
         result
     });
-    Ok((rendered_command, handle))
+    Ok((rendered_command, handle, control))
 }
 
 async fn store_job(
     session: &config::Session,
     rendered_command: String,
     handle: JoinHandle<Result<String>>,
+    control: sandbox::CommandControl,
     activity: &str,
 ) -> Result<Value> {
     let job_id = Uuid::new_v4();
@@ -802,6 +864,7 @@ async fn store_job(
             session_id: session.id.clone(),
             command: rendered_command.clone(),
             handle,
+            control,
         },
     );
     approvals::activity(
@@ -817,42 +880,75 @@ async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
     let finished = {
         let jobs = jobs().lock().unwrap();
-        let job = jobs.get(&job_id).context("unknown job_id")?;
-        anyhow::ensure!(
-            job.session_id == session.id,
-            "job does not belong to this session"
-        );
-        job.handle.is_finished()
+        match jobs.get(&job_id) {
+            Some(job) => {
+                anyhow::ensure!(
+                    job.session_id == session.id,
+                    "job does not belong to this session"
+                );
+                Some(job.handle.is_finished())
+            }
+            None => None,
+        }
     };
-    if !finished {
-        return text_result(json!({"status":"running","job_id":job_id}).to_string());
+    match finished {
+        None => cached_terminal_result(job_id, &session.id)?
+            .with_context(|| format!("unknown job_id: {job_id}")),
+        Some(false) => text_result(json!({"status":"running","job_id":job_id}).to_string()),
+        Some(true) => {
+            let job = jobs().lock().unwrap().remove(&job_id).unwrap();
+            let result = match job.handle.await {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!("background command task failed: {error}")),
+            };
+            remember_terminal_job(job_id, &session.id, &result);
+            text_result(result?)
+        }
     }
-
-    let job = jobs().lock().unwrap().remove(&job_id).unwrap();
-    let result = job.handle.await.context("background command task failed")?;
-    text_result(result?)
 }
 
 async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
     let job = {
         let mut jobs = jobs().lock().unwrap();
-        let job = jobs.get(&job_id).context("unknown job_id")?;
-        anyhow::ensure!(
-            job.session_id == session.id,
-            "job does not belong to this session"
-        );
-        jobs.remove(&job_id).unwrap()
+        if let Some(job) = jobs.get(&job_id) {
+            anyhow::ensure!(
+                job.session_id == session.id,
+                "job does not belong to this session"
+            );
+        }
+        jobs.remove(&job_id)
     };
-    job.handle.abort();
-    let _ = job.handle.await;
+
+    let Some(job) = job else {
+        return cached_terminal_result(job_id, &session.id)?
+            .with_context(|| format!("unknown job_id: {job_id}"));
+    };
+
+    job.control.request_stop();
+    let result = match job.handle.await {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::anyhow!("background command task failed: {error}")),
+    };
+    remember_terminal_job(job_id, &session.id, &result);
+    let termination = result
+        .as_ref()
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| {
+            value
+                .get("termination")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "failed".to_owned());
     approvals::activity(
         &session.id,
         format!("Stopped {}", job.command),
-        Some(format!("└ job {job_id}")),
+        Some(format!("└ job {job_id}; termination {termination}")),
     )
     .await;
-    text_result(json!({"status":"stopped","job_id":job_id}).to_string())
+    text_result(result?)
 }
 
 fn required_job_id(args: &Value) -> Result<Uuid> {
@@ -980,12 +1076,19 @@ fn render_diff(old: &str, new: &str) -> (usize, usize, String) {
 }
 
 fn render_output(output: sandbox::Output) -> Result<String> {
-    let text = json!({"exit_code":output.status,"stdout":output.stdout,"stderr":output.stderr})
-        .to_string();
-    if output.status == 0 {
-        Ok(text)
-    } else {
+    let termination = output.termination;
+    let text = json!({
+        "exit_code": output.status,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "termination": termination.as_str(),
+        "termination_trigger": termination.trigger().map(sandbox::StopTrigger::as_str),
+    })
+    .to_string();
+    if termination == sandbox::Termination::Exited && output.status != 0 {
         anyhow::bail!(text)
+    } else {
+        Ok(text)
     }
 }
 
@@ -1130,6 +1233,53 @@ mod tests {
     fn rejects_unknown_ui_resource() {
         let error = read_resource(&json!({"uri": "ui://local-mcp/unknown.html"})).unwrap_err();
         assert!(error.to_string().contains("unknown resource"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_stop_job_calls_return_the_same_terminal_result() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-stop-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = config::Session {
+            id: format!("stop-test-{}", Uuid::new_v4()),
+            cwd: directory.clone(),
+            permitted_directories: vec![directory.clone()],
+        };
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()];
+        let (control, cancellation) = sandbox::command_control();
+        let task_directory = directory.clone();
+        let handle = tokio::spawn(async move {
+            sandbox::run_unrestricted_controlled(
+                &command,
+                &task_directory,
+                None,
+                cancellation,
+                None,
+            )
+            .await
+            .and_then(render_output)
+        });
+        let job_id = Uuid::new_v4();
+        jobs().lock().unwrap().insert(
+            job_id,
+            Job {
+                session_id: session.id.clone(),
+                command: "sh -c sleep".to_owned(),
+                handle,
+                control,
+            },
+        );
+
+        let args = json!({"job_id": job_id.to_string()});
+        let first = stop_job(&args, &session).await.unwrap();
+        let second = stop_job(&args, &session).await.unwrap();
+        assert_eq!(first, second);
+        let text = first["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"termination\":\"stopped\""));
+        assert!(text.contains("\"termination_trigger\":\"stop\""));
+
+        terminal_jobs().lock().unwrap().remove(&job_id);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[test]
