@@ -82,6 +82,49 @@ that turn has ended. For example, an agent emulating `every 5m` should use
 `interval_seconds: 300`, wait until `status: "tick"`, do one work cycle, and then
 resume calling `heartbeat_wait`.
 
+## Reliable agent execution
+
+The server's `initialize` response includes concise execution rules so MCP clients
+receive the same guidance even when no external system prompt is installed. These
+rules are advisory; they reduce accidental sequencing mistakes but do not replace
+server-side sandboxing, approval checks, or explicit artifact gates.
+
+Use direct argv arrays for ordinary commands:
+
+```json
+{"session_id":"...","command":["cargo","test","--locked"]}
+```
+
+Do not send a shell program as the `command` value:
+
+```json
+{"session_id":"...","command":"set -euo pipefail; cargo test | tee test.log"}
+```
+
+This release has no dedicated shell-program tool. If shell syntax is unavoidable,
+invoke the platform shell explicitly in argv and keep the script bounded and
+reviewable. Prefer a checked-in script for substantial workflows.
+
+For work likely to exceed the 30-second foreground timeout, use `start_command`
+and poll with short `poll_job` calls. Do not start a command whose only purpose is
+to sleep before polling. After a schema error, tool error, or non-zero process
+exit, inspect the failure and stop dependent stages. A stage is successful only
+when the process exits with status zero **and** every required artifact exists.
+Keep large output in files and inspect a bounded tail, and execute one checked
+stage at a time for destructive or real-system workflows.
+
+Good sequencing:
+
+```text
+edit -> focused test exits 0 -> verify expected file -> acceptance test -> commit
+```
+
+Unsafe sequencing:
+
+```text
+edit -> test fails -> assume artifact exists -> run destructive acceptance step
+```
+
 Each session uses its own local IPC endpoint: an explicitly permission-restricted
 Unix domain socket on Unix, or a named pipe using Windows' default security
 descriptor. Both the MCP server and the start UI block on I/O, so idle operation

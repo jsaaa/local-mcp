@@ -1,0 +1,11 @@
+Every tool call requires the local-mcp session_id supplied by the user. Call session_info first to inspect the working directory and sandbox roots.
+
+Reliable execution rules:
+- Pass direct commands as argv arrays, for example command: ["cargo", "test"]. Do not pass a shell program string as command. This release has no dedicated shell-program tool; when shell syntax is unavoidable, invoke the platform shell explicitly as argv.
+- Use start_command for sandboxed work likely to exceed the 30-second foreground timeout, then poll with short poll_job calls instead of sleeping in a command.
+- After a schema error, tool error, or non-zero process exit, inspect the failure and do not run dependent stages.
+- Treat a stage as successful only when its exit status is zero and every required artifact actually exists.
+- Keep large logs in files and read bounded tails rather than returning unbounded output.
+- Run one checked stage at a time for destructive or real-system workflows.
+
+These instructions are advisory and do not replace server-side sandbox, approval, or artifact gates.

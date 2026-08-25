@@ -19,6 +19,17 @@ const HEARTBEAT_MAX_WAIT: Duration = Duration::from_secs(25);
 const HEARTBEAT_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const IMAGE_VIEWER_URI: &str = "ui://local-mcp/image-viewer-v1.html";
 const MCP_APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
+const INITIALIZE_INSTRUCTIONS: &str = r#"Every tool call requires the local-mcp session_id supplied by the user. Call session_info first to inspect the working directory and sandbox roots.
+
+Reliable execution rules:
+- Pass direct commands as argv arrays, for example command: ["cargo", "test"]. Do not pass a shell program string as command. This release has no dedicated shell-program tool; when shell syntax is unavoidable, invoke the platform shell explicitly as argv.
+- Use start_command for sandboxed work likely to exceed the 30-second foreground timeout, then poll with short poll_job calls instead of sleeping in a command.
+- After a schema error, tool error, or non-zero process exit, inspect the failure and do not run dependent stages.
+- Treat a stage as successful only when its exit status is zero and every required artifact actually exists.
+- Keep large logs in files and read bounded tails rather than returning unbounded output.
+- Run one checked stage at a time for destructive or real-system workflows.
+
+These instructions are advisory and do not replace server-side sandbox, approval, or artifact gates."#;
 const IMAGE_VIEWER_HTML: &str = r#"<!doctype html>
 <html>
 <head>
@@ -248,7 +259,7 @@ async fn dispatch(request: &Value) -> Result<Value> {
                 "resources": {"subscribe": false, "listChanged": false}
             },
             "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
+            "instructions": INITIALIZE_INSTRUCTIONS
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
@@ -295,13 +306,13 @@ fn tools() -> Value {
     #[cfg(windows)]
     let write_file_description = "Write a UTF-8 file directly on the Windows host without a Codex sandbox. Relative paths use the session working directory.";
     #[cfg(not(windows))]
-    let execute_description = "Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required.";
+    let execute_description = "Execute argv without a shell in the Codex sandbox, for example command: [\"cargo\", \"test\"]. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required. Inspect any non-zero result before running dependent stages.";
     #[cfg(windows)]
-    let execute_description = "Execute argv without a shell directly on the Windows host. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
+    let execute_description = "Execute argv without a shell directly on the Windows host, for example command: [\"cargo\", \"test\"]. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. This has the user's filesystem and network access and requires approval unless the session is in yolo mode. Inspect any non-zero result before running dependent stages.";
     #[cfg(not(windows))]
-    let start_command_description = "Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required.";
+    let start_command_description = "Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Use this for work likely to exceed 30 seconds, then poll with short poll_job calls. Network is disabled and approval is not required.";
     #[cfg(windows)]
-    let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
+    let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. Use this for work likely to exceed 30 seconds, then poll with short poll_job calls. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
 
     let mut tools = json!([
         {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
@@ -311,13 +322,13 @@ fn tools() -> Value {
         {"name":"write_file","description":write_file_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
         {"name":"execute","description":execute_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
-        {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed. Poll in short MCP calls; do not run a sleeping command while waiting.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"heartbeat_start","description":"Start or reset an in-turn heartbeat schedule for this local-mcp session. After starting it, call heartbeat_wait repeatedly. A tick is delivered only while heartbeat_wait is actively waiting; ticks that occur while the agent is busy doing work are skipped instead of queued.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"interval_seconds":{"type":"integer","minimum":1,"maximum":86400},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id","interval_seconds"],"additionalProperties":false}},
         {"name":"heartbeat_wait","description":"Wait for the next heartbeat tick in short long-poll chunks. Call this repeatedly until status is tick, then do one work cycle and call it again. If a scheduled tick passes while no heartbeat_wait call is active because the agent is still working, that tick is skipped. This does not revive a ChatGPT turn after the turn has ended.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"max_wait_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["session_id"],"additionalProperties":false}},
         {"name":"heartbeat_status","description":"Show the current in-turn heartbeat schedule, delivered tick count, skipped tick count, and time until the next tick.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
         {"name":"heartbeat_stop","description":"Stop and remove an in-turn heartbeat schedule for this local-mcp session.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
+        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Pass an argv array such as command: [\"git\", \"status\"]. Every call requires approval unless the session is in yolo mode. Inspect any non-zero result before running dependent stages.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
     ]);
     for tool in tools.as_array_mut().unwrap() {
         if let Some(session_id) = tool
@@ -1180,5 +1191,34 @@ mod tests {
         assert_eq!(missed, 5);
         assert_eq!(heartbeat.skipped_ticks, 5);
         assert_eq!(heartbeat.next_tick, start + Duration::from_secs(360));
+    }
+
+    #[test]
+    fn initialize_instructions_match_snapshot() {
+        assert_eq!(
+            INITIALIZE_INSTRUCTIONS,
+            include_str!("../tests/snapshots/initialize_instructions.txt").trim_end()
+        );
+    }
+
+    #[test]
+    fn execution_tool_descriptions_include_reliability_guidance() {
+        let tools = tools();
+        let description = |name: &str| {
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+        };
+
+        assert!(description("execute").contains("command: [\"cargo\", \"test\"]"));
+        assert!(description("execute").contains("dependent stages"));
+        assert!(description("start_command").contains("likely to exceed 30 seconds"));
+        assert!(description("poll_job").contains("short MCP calls"));
+        assert!(description("without_sandbox").contains("command: [\"git\", \"status\"]"));
     }
 }
