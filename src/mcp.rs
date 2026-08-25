@@ -19,6 +19,8 @@ const HEARTBEAT_MAX_WAIT: Duration = Duration::from_secs(25);
 const HEARTBEAT_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const IMAGE_VIEWER_URI: &str = "ui://local-mcp/image-viewer-v1.html";
 const MCP_APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
+const SHELL_PROGRAM: &str = "bash";
+const SHELL_PREVIEW_LIMIT: usize = 160;
 const IMAGE_VIEWER_HTML: &str = r#"<!doctype html>
 <html>
 <head>
@@ -302,6 +304,14 @@ fn tools() -> Value {
     let start_command_description = "Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required.";
     #[cfg(windows)]
     let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
+    #[cfg(not(windows))]
+    let execute_shell_description = "Execute a multi-line Bash program in the Codex sandbox. Pass the program in script as a string; pipelines, heredocs, and set -euo pipefail are supported. Returns the normal result within 30 seconds or a job_id afterward. Network is disabled and approval is not required.";
+    #[cfg(windows)]
+    let execute_shell_description = "Shell-program execution is unsupported on Windows. Use execute with an explicit PowerShell argv command instead.";
+    #[cfg(not(windows))]
+    let without_sandbox_shell_description = "Execute a multi-line Bash program directly on the host with full user permissions and network access. Pass the program in script as a string. Approval is required before launch unless the session is in yolo mode.";
+    #[cfg(windows)]
+    let without_sandbox_shell_description = "Shell-program execution is unsupported on Windows. Use without_sandbox with an explicit PowerShell argv command instead.";
 
     let mut tools = json!([
         {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
@@ -310,6 +320,7 @@ fn tools() -> Value {
         {"name":"list_directory","description":"List entries in a local directory. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
         {"name":"write_file","description":write_file_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
         {"name":"execute","description":execute_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
+        {"name":"execute_shell","description":execute_shell_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"script":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id","script"],"additionalProperties":false}},
         {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
@@ -317,7 +328,8 @@ fn tools() -> Value {
         {"name":"heartbeat_wait","description":"Wait for the next heartbeat tick in short long-poll chunks. Call this repeatedly until status is tick, then do one work cycle and call it again. If a scheduled tick passes while no heartbeat_wait call is active because the agent is still working, that tick is skipped. This does not revive a ChatGPT turn after the turn has ended.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"max_wait_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["session_id"],"additionalProperties":false}},
         {"name":"heartbeat_status","description":"Show the current in-turn heartbeat schedule, delivered tick count, skipped tick count, and time until the next tick.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
         {"name":"heartbeat_stop","description":"Stop and remove an in-turn heartbeat schedule for this local-mcp session.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
+        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
+        {"name":"without_sandbox_shell","description":without_sandbox_shell_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"script":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id","script"],"additionalProperties":false}}
     ]);
     for tool in tools.as_array_mut().unwrap() {
         if let Some(session_id) = tool
@@ -383,6 +395,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
         }
         "write_file" => write_file(&args, &session).await,
         "execute" => execute(&args, &session).await,
+        "execute_shell" => execute_shell(&args, &session).await,
         "start_command" => start_command(&args, &session).await,
         "poll_job" => poll_job(&args, &session).await,
         "stop_job" => stop_job(&args, &session).await,
@@ -391,6 +404,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
         "heartbeat_status" => heartbeat_status(&args, &session).await,
         "heartbeat_stop" => heartbeat_stop(&args, &session).await,
         "without_sandbox" => without_sandbox(&args, &session).await,
+        "without_sandbox_shell" => without_sandbox_shell(&args, &session).await,
         _ => anyhow::bail!("unknown tool: {name}"),
     }
 }
@@ -745,6 +759,34 @@ async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
     }
 }
 
+async fn execute_shell(args: &Value, session: &config::Session) -> Result<Value> {
+    validate_shell_args(args)?;
+    let script = required_script(args)?;
+    let command = shell_command(&script)?;
+    let cwd = cwd(args, &session.cwd)?;
+    let mut roots = session.permitted_directories.clone();
+    if !roots.iter().any(|root| cwd.starts_with(root)) {
+        roots.push(cwd.clone());
+    }
+    let display = shell_activity_label(&script);
+    approvals::activity(&session.id, format!("Running {display}"), None).await;
+    let session_id = session.id.clone();
+    let task_display = display.clone();
+    let handle = tokio::spawn(async move {
+        let result = sandbox::run(&command, &cwd, &roots, None)
+            .await
+            .and_then(render_output);
+        report_command_finished(session_id, &task_display, &result).await;
+        result
+    });
+
+    let mut handle = handle;
+    match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
+        Ok(joined) => text_result(joined.context("shell command task failed")??),
+        Err(_) => store_job(session, display, handle, "Backgrounded").await,
+    }
+}
+
 async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
     let (rendered_command, handle) =
         spawn_sandboxed_command("start_command", args, session).await?;
@@ -876,6 +918,101 @@ fn required_command(args: &Value) -> Result<Vec<String>> {
         .collect()
 }
 
+fn validate_shell_args(args: &Value) -> Result<()> {
+    let object = args
+        .as_object()
+        .context("tool arguments must be an object")?;
+    for key in object.keys() {
+        anyhow::ensure!(
+            matches!(key.as_str(), "session_id" | "script" | "cwd"),
+            "unknown shell-tool argument: {key}"
+        );
+    }
+    Ok(())
+}
+
+fn required_script(args: &Value) -> Result<String> {
+    args.get("script")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("missing script; shell tools require script to be a string")
+}
+
+fn shell_command(script: &str) -> Result<Vec<String>> {
+    #[cfg(unix)]
+    {
+        Ok(vec![
+            SHELL_PROGRAM.to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+        ])
+    }
+    #[cfg(windows)]
+    {
+        let _ = script;
+        anyhow::bail!(
+            "shell-program tools are unsupported on Windows; invoke PowerShell explicitly with an argv tool"
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = script;
+        anyhow::bail!("shell-program tools are unsupported on this platform")
+    }
+}
+
+fn shell_activity_label(script: &str) -> String {
+    format!(
+        "{SHELL_PROGRAM} script ({} bytes; preview: {})",
+        script.len(),
+        shell_script_preview(script)
+    )
+}
+
+fn shell_script_preview(script: &str) -> String {
+    let mut preview = script
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let lower = line.to_ascii_lowercase();
+            let sensitive = [
+                "authorization",
+                "cookie",
+                "password",
+                "passwd",
+                "secret",
+                "token",
+                "api_key",
+                "apikey",
+                "private_key",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker));
+            Some(if sensitive {
+                "[redacted sensitive line]".to_owned()
+            } else {
+                line.to_owned()
+            })
+        })
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ⏎ ");
+    if preview.is_empty() {
+        preview = "<empty>".to_owned();
+    }
+
+    let mut chars = preview.chars();
+    let bounded = chars.by_ref().take(SHELL_PREVIEW_LIMIT).collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
+
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
     let command = required_command(args)?;
     let cwd = cwd(args, &session.cwd)?;
@@ -892,6 +1029,25 @@ async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Valu
     run_and_report(session.id.clone(), command, cwd, true, &[]).await
 }
 
+async fn without_sandbox_shell(args: &Value, session: &config::Session) -> Result<Value> {
+    validate_shell_args(args)?;
+    let script = required_script(args)?;
+    let command = shell_command(&script)?;
+    let cwd = cwd(args, &session.cwd)?;
+    let display = shell_activity_label(&script);
+    if !approvals::request(
+        &session.id,
+        "without_sandbox_shell",
+        format!("shell: {SHELL_PROGRAM}\n{display}"),
+        cwd.clone(),
+    )
+    .await?
+    {
+        anyhow::bail!("user denied without_sandbox_shell")
+    }
+    run_and_report_named(session.id.clone(), command, cwd, true, &[], display).await
+}
+
 async fn run_and_report(
     session_id: String,
     command: Vec<String>,
@@ -900,6 +1056,25 @@ async fn run_and_report(
     roots: &[PathBuf],
 ) -> Result<Value> {
     let rendered_command = render_command(&command);
+    run_and_report_named(
+        session_id,
+        command,
+        cwd,
+        unrestricted,
+        roots,
+        rendered_command,
+    )
+    .await
+}
+
+async fn run_and_report_named(
+    session_id: String,
+    command: Vec<String>,
+    cwd: PathBuf,
+    unrestricted: bool,
+    roots: &[PathBuf],
+    rendered_command: String,
+) -> Result<Value> {
     approvals::activity(&session_id, format!("Running {rendered_command}"), None).await;
     let output = if unrestricted {
         sandbox::run_unrestricted(&command, &cwd, None).await
@@ -1130,6 +1305,162 @@ mod tests {
     fn rejects_unknown_ui_resource() {
         let error = read_resource(&json!({"uri": "ui://local-mcp/unknown.html"})).unwrap_err();
         assert!(error.to_string().contains("unknown resource"));
+    }
+
+    #[test]
+    fn shell_tools_use_string_schemas_without_changing_argv_tools() {
+        let tools = tools();
+        let find = |name: &str| {
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()
+        };
+
+        for name in ["execute_shell", "without_sandbox_shell"] {
+            let tool = find(name);
+            assert_eq!(
+                tool["inputSchema"]["properties"]["script"]["type"],
+                "string"
+            );
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert!(tool["inputSchema"]["properties"].get("command").is_none());
+            assert!(
+                tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("script"))
+            );
+        }
+
+        assert_eq!(
+            find("execute")["inputSchema"]["properties"]["command"]["type"],
+            "array"
+        );
+        assert_eq!(
+            find("without_sandbox")["inputSchema"]["properties"]["command"]["type"],
+            "array"
+        );
+    }
+
+    #[test]
+    fn shell_argument_validation_rejects_wrong_types_and_unknown_fields() {
+        assert!(required_script(&json!({"script": ["echo", "hello"]})).is_err());
+        assert!(
+            validate_shell_args(&json!({
+                "session_id": "example",
+                "script": "true",
+                "extra": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_command_uses_bash_and_preserves_multiline_programs() {
+        let script =
+            "set -euo pipefail\nprintf '%s\n' hello | sed 's/hello/world/'\ncat <<'EOF'\ndone\nEOF";
+        let command = shell_command(script).unwrap();
+        assert_eq!(command, vec!["bash", "-c", script]);
+    }
+
+    #[test]
+    fn shell_activity_preview_is_bounded_and_redacts_sensitive_lines() {
+        let script = format!(
+            "echo safe\nTOKEN={}\necho {}",
+            "x".repeat(200),
+            "y".repeat(300)
+        );
+        let preview = shell_script_preview(&script);
+        assert!(preview.contains("echo safe"));
+        assert!(preview.contains("[redacted sensitive line]"));
+        assert!(preview.chars().count() <= SHELL_PREVIEW_LIMIT + 1);
+        assert!(!preview.contains(&"x".repeat(20)));
+    }
+
+    #[cfg(unix)]
+    async fn start_approval_responder(
+        session_id: &str,
+        response: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::net::UnixListener;
+
+        let path = config::socket_path(session_id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            assert!(line.contains("without_sandbox_shell"));
+            stream
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    fn shell_test_session(directory: &Path) -> config::Session {
+        config::Session {
+            id: format!("shell-test-{}", Uuid::new_v4()),
+            cwd: directory.to_owned(),
+            permitted_directories: vec![directory.to_owned()],
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn denied_shell_approval_never_starts_the_process() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-shell-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = shell_test_session(&directory);
+        let marker = directory.join("should-not-exist");
+        let responder = start_approval_responder(&session.id, "deny").await;
+
+        let error = without_sandbox_shell(
+            &json!({"script": format!("printf started > {}", marker.display())}),
+            &session,
+        )
+        .await
+        .unwrap_err();
+        responder.await.unwrap();
+
+        assert!(error.to_string().contains("user denied"));
+        assert!(!marker.exists());
+        let _ = tokio::fs::remove_file(config::socket_path(&session.id).unwrap()).await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_shell_honors_cwd_and_reports_nonzero_exit() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-shell-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = shell_test_session(&directory);
+        let responder = start_approval_responder(&session.id, "allow").await;
+
+        let error = without_sandbox_shell(&json!({"script": "pwd > cwd.txt\nexit 7"}), &session)
+            .await
+            .unwrap_err();
+        responder.await.unwrap();
+
+        assert!(error.to_string().contains("\"exit_code\":7"));
+        let recorded = tokio::fs::read_to_string(directory.join("cwd.txt"))
+            .await
+            .unwrap();
+        assert_eq!(recorded.trim(), directory.to_string_lossy());
+        let _ = tokio::fs::remove_file(config::socket_path(&session.id).unwrap()).await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[test]
