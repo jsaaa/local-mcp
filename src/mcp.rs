@@ -1399,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_arguments_reject_missing_wrong_and_unknown_fields() {
+    fn typed_arguments_preserve_legacy_unknown_and_null_behavior() {
         assert!(
             deserialize_tool_arguments(ToolName::SessionInfo, &json!({})).is_err(),
             "missing required session_id must fail"
@@ -1429,46 +1429,217 @@ mod tests {
                     "unexpected": true
                 }),
             )
-            .is_err(),
-            "unknown fields must fail"
+            .is_ok(),
+            "execute ignored unknown fields before typed argument migration"
         );
         assert!(
             deserialize_tool_arguments(
-                ToolName::HeartbeatStart,
-                &json!({"session_id": "schema-contract", "interval_seconds": 0}),
+                ToolName::SessionInfo,
+                &json!({"session_id": "schema-contract", "unexpected": true}),
             )
             .is_err(),
-            "runtime validation must match the schema minimum"
-        );
-        assert!(
-            deserialize_tool_arguments(
-                ToolName::HeartbeatWait,
-                &json!({"session_id": "schema-contract", "max_wait_seconds": 26}),
-            )
-            .is_err(),
-            "runtime validation must match the schema maximum"
-        );
-        assert!(
-            deserialize_tool_arguments(ToolName::SessionInfo, &json!({"session_id": "."}),)
-                .is_err(),
-            "reserved session IDs must fail"
+            "session_info already rejected unknown fields"
         );
         assert!(
             deserialize_tool_arguments(
                 ToolName::Execute,
                 &json!({"session_id": "schema-contract", "command": ["true"], "cwd": null}),
             )
-            .is_err(),
-            "an explicitly null optional string must fail when the schema says string"
+            .is_ok(),
+            "explicit null cwd remains equivalent to omission"
         );
         assert!(
             deserialize_tool_arguments(
                 ToolName::HeartbeatStatus,
                 &json!({"session_id": "schema-contract", "name": null}),
             )
-            .is_err(),
-            "an explicitly null heartbeat name must fail"
+            .is_ok(),
+            "explicit null heartbeat name remains equivalent to omission"
         );
+    }
+
+    fn assert_schema_and_serde_agree(tool: ToolName, value: Value, expected: bool) {
+        let schema = tool.input_schema();
+        let validator = jsonschema::validator_for(&schema)
+            .unwrap_or_else(|error| panic!("{} schema did not compile: {error}", tool.as_str()));
+        let schema_accepts = validator.is_valid(&value);
+        let serde_accepts = deserialize_tool_arguments(tool, &value).is_ok();
+        assert_eq!(
+            schema_accepts,
+            serde_accepts,
+            "schema/Serde mismatch for {} with {value}",
+            tool.as_str()
+        );
+        assert_eq!(
+            schema_accepts,
+            expected,
+            "unexpected contract result for {} with {value}",
+            tool.as_str()
+        );
+    }
+
+    #[test]
+    fn generated_schemas_and_serde_agree_on_boundaries() {
+        let valid_job_id = "00000000-0000-4000-8000-000000000001";
+        let cases = [
+            (
+                ToolName::SessionInfo,
+                json!({"session_id": "schema-contract"}),
+                true,
+            ),
+            (ToolName::SessionInfo, json!({}), false),
+            (ToolName::SessionInfo, json!({"session_id": "."}), false),
+            (ToolName::SessionInfo, json!({"session_id": ".."}), false),
+            (
+                ToolName::SessionInfo,
+                json!({"session_id": "x".repeat(64)}),
+                true,
+            ),
+            (
+                ToolName::SessionInfo,
+                json!({"session_id": "x".repeat(65)}),
+                false,
+            ),
+            (
+                ToolName::SessionInfo,
+                json!({"session_id": "contains spaces"}),
+                false,
+            ),
+            (
+                ToolName::SessionInfo,
+                json!({"session_id": "schema-contract", "extra": true}),
+                false,
+            ),
+            (
+                ToolName::ReadFile,
+                json!({"session_id": "schema-contract", "path": "README.md", "extra": true}),
+                true,
+            ),
+            (
+                ToolName::GetImage,
+                json!({"session_id": "schema-contract", "path": "image.png", "extra": true}),
+                false,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": ["true"]}),
+                true,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": ["true"], "cwd": null}),
+                true,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": ["true"], "cwd": "."}),
+                true,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": ["true"], "cwd": 1}),
+                false,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": []}),
+                false,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": "true"}),
+                false,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": ["true"], "extra": true}),
+                true,
+            ),
+            (
+                ToolName::PollJob,
+                json!({"session_id": "schema-contract", "job_id": valid_job_id}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 86400}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 0}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 86401}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1, "name": null}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1, "name": ""}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1, "name": "x".repeat(64)}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1, "name": "x".repeat(65)}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1, "extra": true}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatWait,
+                json!({"session_id": "schema-contract", "name": null, "max_wait_seconds": null}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatWait,
+                json!({"session_id": "schema-contract", "max_wait_seconds": 1}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatWait,
+                json!({"session_id": "schema-contract", "max_wait_seconds": 25}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatWait,
+                json!({"session_id": "schema-contract", "max_wait_seconds": 0}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatWait,
+                json!({"session_id": "schema-contract", "max_wait_seconds": 26}),
+                false,
+            ),
+            (
+                ToolName::WithoutSandbox,
+                json!({"session_id": "schema-contract", "command": ["true"], "cwd": null, "extra": true}),
+                true,
+            ),
+        ];
+
+        for (tool, value, expected) in cases {
+            assert_schema_and_serde_agree(tool, value, expected);
+        }
     }
 
     #[test]
@@ -1559,13 +1730,24 @@ mod tests {
     }
 
     #[test]
-    fn generated_schemas_reject_additional_properties() {
+    fn generated_schemas_preserve_legacy_additional_property_policy() {
+        let strict = [
+            ToolName::SessionInfo,
+            ToolName::GetImage,
+            ToolName::PollJob,
+            ToolName::StopJob,
+            ToolName::HeartbeatStart,
+            ToolName::HeartbeatWait,
+            ToolName::HeartbeatStatus,
+            ToolName::HeartbeatStop,
+        ];
         for tool in ToolName::ALL {
             let schema = tool.input_schema();
+            let expected = strict.contains(&tool).then_some(&Value::Bool(false));
             assert_eq!(
                 schema.get("additionalProperties"),
-                Some(&Value::Bool(false)),
-                "{} must reject unknown fields",
+                expected,
+                "{} must preserve its pre-refactor unknown-field behavior",
                 tool.as_str()
             );
         }

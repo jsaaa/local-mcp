@@ -12,14 +12,6 @@ use crate::config;
 pub const HEARTBEAT_MAX_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 pub const HEARTBEAT_MAX_WAIT_SECONDS: u64 = 25;
 
-fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
-}
-
 #[derive(Clone, Debug)]
 pub struct SessionId(String);
 
@@ -278,7 +270,6 @@ pub struct SessionInfoArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ReadFileArgs {
     pub session_id: SessionId,
     pub path: String,
@@ -293,14 +284,12 @@ pub struct GetImageArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ListDirectoryArgs {
     pub session_id: SessionId,
     pub path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct WriteFileArgs {
     pub session_id: SessionId,
     pub path: String,
@@ -308,20 +297,18 @@ pub struct WriteFileArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ExecuteArgs {
     pub session_id: SessionId,
     pub command: CommandArgv,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    #[serde(default)]
     pub cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct StartCommandArgs {
     pub session_id: SessionId,
     pub command: CommandArgv,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    #[serde(default)]
     pub cwd: Option<String>,
 }
 
@@ -344,7 +331,7 @@ pub struct StopJobArgs {
 pub struct HeartbeatStartArgs {
     pub session_id: SessionId,
     pub interval_seconds: HeartbeatInterval,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    #[serde(default)]
     pub name: Option<HeartbeatName>,
 }
 
@@ -352,9 +339,9 @@ pub struct HeartbeatStartArgs {
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatWaitArgs {
     pub session_id: SessionId,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    #[serde(default)]
     pub name: Option<HeartbeatName>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    #[serde(default)]
     pub max_wait_seconds: Option<HeartbeatWait>,
 }
 
@@ -362,7 +349,7 @@ pub struct HeartbeatWaitArgs {
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatStatusArgs {
     pub session_id: SessionId,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    #[serde(default)]
     pub name: Option<HeartbeatName>,
 }
 
@@ -370,15 +357,14 @@ pub struct HeartbeatStatusArgs {
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatStopArgs {
     pub session_id: SessionId,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    #[serde(default)]
     pub name: Option<HeartbeatName>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct WithoutSandboxArgs {
     pub session_id: SessionId,
     pub command: CommandArgv,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    #[serde(default)]
     pub cwd: Option<String>,
 }
