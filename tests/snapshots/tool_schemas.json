@@ -1,0 +1,466 @@
+[
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "session_info"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "read_file"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image.",
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "get_image"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "list_directory"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "path",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "write_file"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "execute"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "start_command"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "poll_job"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "stop_job"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "interval_seconds": {
+          "format": "uint64",
+          "maximum": 86400.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "interval_seconds",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "heartbeat_start"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "max_wait_seconds": {
+          "format": "uint64",
+          "maximum": 25.0,
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "heartbeat_wait"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "heartbeat_status"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "heartbeat_stop"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "without_sandbox"
+  }
+]

@@ -2241,6 +2241,7 @@ dependencies = [
  "rama-error",
  "rama-macros",
  "rama-utils",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "similar",
@@ -3547,6 +3548,7 @@ dependencies = [
  "schemars_derive",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
