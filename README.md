@@ -107,8 +107,10 @@ from starting.
 
 `poll_job` first checks the live in-memory handle. If that handle was lost across
 an MCP server restart, it loads the persisted result. Completed and failed
-results therefore remain available after restart. A record that was still
-`running` but has no live handle is explicitly changed to `orphaned`; local-mcp
+results therefore remain available after restart. Calling `stop_job` after a
+job has already completed or failed returns that terminal state and result; it
+never rewrites the record as `stopped`. A record that was still `running` but has
+no live handle is explicitly changed to `orphaned`; local-mcp
 does not claim that it can reattach to an arbitrary process. The first journal
 format records the server PID and reserves a process-ID field, but current
 sandbox execution does not expose a safely reattachable process identity, so
@@ -129,8 +131,13 @@ The state filter accepts `running`, `completed`, `failed`, `stopped`, and
 `orphaned`; `limit` is capped at 100. Journal lookup and listing are isolated by
 session ID. Terminal records older than 30 days are removed, and each session is
 bounded to 256 records; running records are not deleted merely to satisfy the
-count limit. Corrupt entries are omitted from a list response and counted in its
-`corrupt_entries` field.
+count limit. Persisted result/error fields are capped at 64 KiB of serialized
+JSON and replaced by a UTF-8-safe head/tail envelope when truncated. Rendered
+commands are also bounded, and each complete journal snapshot is capped at 128
+KiB; oversized snapshots fail closed before being read. Corrupt entries are
+omitted from a list response and counted in its `corrupt_entries` field. On
+Windows, argv jobs are recorded as `unrestricted` because they execute directly
+on the host after approval rather than inside the Linux/macOS sandbox.
 
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is

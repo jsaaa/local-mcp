@@ -738,6 +738,17 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
     text_result(result?)
 }
 
+fn argv_execution_mode() -> job_journal::ExecutionMode {
+    #[cfg(windows)]
+    {
+        job_journal::ExecutionMode::Unrestricted
+    }
+    #[cfg(not(windows))]
+    {
+        job_journal::ExecutionMode::Sandboxed
+    }
+}
+
 async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
     let (job_id, rendered_command, mut handle) =
         spawn_sandboxed_command("execute", args, session).await?;
@@ -785,7 +796,7 @@ async fn spawn_sandboxed_command(
         job_id,
         rendered_command.clone(),
         cwd.clone(),
-        job_journal::ExecutionMode::Sandboxed,
+        argv_execution_mode(),
     )?;
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
     let session_id = session.id.clone();
@@ -853,11 +864,10 @@ async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
             match job.handle.await {
                 Ok(result) => text_result(result?),
                 Err(join_error) => {
-                    let result: Result<String> = Err(anyhow::anyhow!(
-                        "background command task failed: {join_error}"
-                    ));
-                    let _ = job_journal::finish(&session.id, job_id, &result);
-                    Err(result.unwrap_err())
+                    let message = format!("background command task failed: {join_error}");
+                    let persisted_failure: Result<String> = Err(anyhow::anyhow!(message.clone()));
+                    let _ = job_journal::finish(&session.id, job_id, &persisted_failure);
+                    Err(anyhow::anyhow!(message))
                 }
             }
         }
@@ -867,30 +877,68 @@ async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
 async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
     let job = {
-        let mut jobs = jobs().lock().unwrap();
-        if let Some(job) = jobs.get(&job_id) {
+        let mut all_jobs = jobs().lock().unwrap();
+        if let Some(job) = all_jobs.get(&job_id) {
             anyhow::ensure!(
                 job.session_id == session.id,
                 "job does not belong to this session"
             );
         }
-        jobs.remove(&job_id)
+        all_jobs.remove(&job_id)
     };
 
-    if let Some(job) = job {
+    let Some(job) = job else {
+        return persisted_job_result(job_journal::load(&session.id, job_id, false)?);
+    };
+
+    let command = job.command.clone();
+    let record = if job.handle.is_finished() {
+        settle_joined_job(&session.id, job_id, job.handle.await).await?
+    } else {
         job.handle.abort();
-        let _ = job.handle.await;
-        let record = job_journal::mark_stopped(&session.id, job_id)?;
-        approvals::activity(
-            &session.id,
-            format!("Stopped {}", job.command),
+        match job.handle.await {
+            Ok(result) => job_journal::finish(&session.id, job_id, &result)?,
+            Err(join_error) if join_error.is_cancelled() => {
+                job_journal::mark_stopped(&session.id, job_id)?
+            }
+            Err(join_error) => {
+                let failure: Result<String> = Err(anyhow::anyhow!(
+                    "background command task failed while stopping: {join_error}"
+                ));
+                job_journal::finish(&session.id, job_id, &failure)?
+            }
+        }
+    };
+
+    let (title, detail) = if record.state == job_journal::JobState::Stopped {
+        (
+            format!("Stopped {command}"),
             Some(format!("└ job {job_id}")),
         )
-        .await;
-        return persisted_job_result(record);
-    }
+    } else {
+        (
+            format!("Stop skipped for finished {command}"),
+            Some(format!("└ job {job_id} already {}", record.state.as_str())),
+        )
+    };
+    approvals::activity(&session.id, title, detail).await;
+    persisted_job_result(record)
+}
 
-    persisted_job_result(job_journal::load(&session.id, job_id, false)?)
+async fn settle_joined_job(
+    session_id: &str,
+    job_id: Uuid,
+    joined: std::result::Result<Result<String>, tokio::task::JoinError>,
+) -> Result<job_journal::JobRecord> {
+    match joined {
+        Ok(result) => job_journal::finish(session_id, job_id, &result),
+        Err(join_error) => {
+            let failure: Result<String> = Err(anyhow::anyhow!(
+                "background command task failed: {join_error}"
+            ));
+            job_journal::finish(session_id, job_id, &failure)
+        }
+    }
 }
 
 async fn list_jobs(args: &Value, session: &config::Session) -> Result<Value> {
@@ -1244,6 +1292,81 @@ mod tests {
             tool["inputSchema"]["properties"]["state"]["enum"],
             json!(["running", "completed", "failed", "stopped", "orphaned"])
         );
+    }
+
+    #[test]
+    fn journal_execution_mode_matches_platform_security_model() {
+        #[cfg(windows)]
+        assert_eq!(
+            argv_execution_mode(),
+            job_journal::ExecutionMode::Unrestricted
+        );
+        #[cfg(not(windows))]
+        assert_eq!(argv_execution_mode(), job_journal::ExecutionMode::Sandboxed);
+    }
+
+    #[tokio::test]
+    async fn stop_finished_in_memory_job_preserves_completed_result() {
+        let directory = std::env::temp_dir();
+        let session = config::Session {
+            id: format!("stop-finished-{}", Uuid::new_v4()),
+            cwd: directory.clone(),
+            permitted_directories: vec![directory],
+        };
+        let job_id = Uuid::new_v4();
+        let result_text = json!({
+            "exit_code": 0,
+            "stdout": "original terminal result",
+            "stderr": ""
+        })
+        .to_string();
+        job_journal::create_running(
+            &session.id,
+            job_id,
+            "true".to_owned(),
+            session.cwd.clone(),
+            argv_execution_mode(),
+        )
+        .unwrap();
+        let persisted_result: Result<String> = Ok(result_text.clone());
+        job_journal::finish(&session.id, job_id, &persisted_result).unwrap();
+        let handle_result = result_text.clone();
+        let handle = tokio::spawn(async move { Ok(handle_result) });
+        for _ in 0..100 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(handle.is_finished());
+        jobs().lock().unwrap().insert(
+            job_id,
+            Job {
+                session_id: session.id.clone(),
+                command: "true".to_owned(),
+                handle,
+            },
+        );
+
+        let response = stop_job(&json!({"job_id": job_id.to_string()}), &session)
+            .await
+            .unwrap();
+        assert!(
+            response["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("original terminal result")
+        );
+        let record = job_journal::load(&session.id, job_id, false).unwrap();
+        assert_eq!(record.state, job_journal::JobState::Completed);
+        assert!(
+            !record
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("stopped")
+        );
+        job_journal::remove_session_for_tests(&session.id);
     }
 
     #[tokio::test]

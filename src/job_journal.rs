@@ -15,6 +15,9 @@ use crate::config;
 const JOURNAL_VERSION: u32 = 1;
 const MAX_JOBS_PER_SESSION: usize = 256;
 const RETENTION_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MAX_COMMAND_BYTES: usize = 8 * 1024;
+pub const MAX_PERSISTED_FIELD_SERIALIZED_BYTES: usize = 64 * 1024;
+pub const MAX_JOURNAL_SNAPSHOT_BYTES: u64 = 128 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -150,7 +153,7 @@ pub fn create_running(
         version: JOURNAL_VERSION,
         job_id: job_id.to_string(),
         session_id: session_id.to_owned(),
-        command,
+        command: bound_plain_text(&command, MAX_COMMAND_BYTES),
         cwd,
         execution_mode,
         state: JobState::Running,
@@ -172,6 +175,9 @@ pub fn create_running(
 pub fn finish(session_id: &str, job_id: Uuid, result: &Result<String>) -> Result<JobRecord> {
     let _guard = journal_lock().lock().unwrap();
     let mut record = load_latest_locked(session_id, job_id)?;
+    if record.state.terminal() {
+        return Ok(record);
+    }
     let now = now_ms();
     record.updated_at_ms = now;
     record.finished_at_ms = Some(now);
@@ -179,7 +185,7 @@ pub fn finish(session_id: &str, job_id: Uuid, result: &Result<String>) -> Result
         Ok(text) => {
             record.state = JobState::Completed;
             record.exit_code = parse_exit_code(text).or(Some(0));
-            record.result = Some(text.clone());
+            record.result = Some(bound_persisted_payload(text, record.exit_code, "result"));
             record.error = None;
         }
         Err(error) => {
@@ -187,7 +193,7 @@ pub fn finish(session_id: &str, job_id: Uuid, result: &Result<String>) -> Result
             record.state = JobState::Failed;
             record.exit_code = parse_exit_code(&text);
             record.result = None;
-            record.error = Some(text);
+            record.error = Some(bound_persisted_payload(&text, record.exit_code, "error"));
         }
     }
     publish_locked(&record)?;
@@ -197,7 +203,7 @@ pub fn finish(session_id: &str, job_id: Uuid, result: &Result<String>) -> Result
 pub fn mark_stopped(session_id: &str, job_id: Uuid) -> Result<JobRecord> {
     let _guard = journal_lock().lock().unwrap();
     let mut record = load_latest_locked(session_id, job_id)?;
-    if record.state == JobState::Stopped {
+    if record.state.terminal() {
         return Ok(record);
     }
     let now = now_ms();
@@ -256,11 +262,12 @@ pub fn list(
         };
         match load_latest_locked(session_id, job_id) {
             Ok(mut record) => {
-                if record.state == JobState::Running && !active_jobs.contains(&job_id) {
-                    if mark_orphaned_locked(&mut record).is_err() {
-                        corrupt_entries += 1;
-                        continue;
-                    }
+                if record.state == JobState::Running
+                    && !active_jobs.contains(&job_id)
+                    && mark_orphaned_locked(&mut record).is_err()
+                {
+                    corrupt_entries += 1;
+                    continue;
                 }
                 if state_filter.is_none_or(|state| state == record.state) {
                     records.push(record);
@@ -294,6 +301,7 @@ pub fn list(
     })
 }
 
+#[cfg(test)]
 pub fn remove_session_for_tests(session_id: &str) {
     if let Ok(root) = session_root(session_id) {
         let _ = fs::remove_dir_all(root);
@@ -310,6 +318,83 @@ fn mark_orphaned_locked(record: &mut JobRecord) -> Result<()> {
             .to_owned(),
     );
     publish_locked(record)
+}
+
+fn bound_persisted_payload(text: &str, exit_code: Option<i32>, kind: &str) -> String {
+    if serde_json::to_vec(text)
+        .map(|bytes| bytes.len() <= MAX_PERSISTED_FIELD_SERIALIZED_BYTES)
+        .unwrap_or(false)
+    {
+        return text.to_owned();
+    }
+
+    let mut preview_budget = MAX_PERSISTED_FIELD_SERIALIZED_BYTES.saturating_sub(1024);
+    loop {
+        let head_budget = preview_budget / 2 + preview_budget % 2;
+        let tail_budget = preview_budget / 2;
+        let value = serde_json::json!({
+            "exit_code": exit_code,
+            "journal_truncated": true,
+            "kind": kind,
+            "original_bytes": text.len(),
+            "head": bounded_utf8_prefix(text, head_budget),
+            "tail": bounded_utf8_suffix(text, tail_budget),
+        });
+        let rendered = value.to_string();
+        let serialized_bytes = serde_json::to_vec(&rendered)
+            .expect("bounded journal payload must serialize")
+            .len();
+        if serialized_bytes <= MAX_PERSISTED_FIELD_SERIALIZED_BYTES {
+            return rendered;
+        }
+        preview_budget = preview_budget.saturating_sub(
+            serialized_bytes
+                .saturating_sub(MAX_PERSISTED_FIELD_SERIALIZED_BYTES)
+                .max(64),
+        );
+    }
+}
+
+fn bound_plain_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    const MARKER: &str = "\n... journal text truncated ...\n";
+    let content_budget = max_bytes.saturating_sub(MARKER.len());
+    let head_budget = content_budget / 2 + content_budget % 2;
+    let tail_budget = content_budget / 2;
+    format!(
+        "{}{}{}",
+        bounded_utf8_prefix(text, head_budget),
+        MARKER,
+        bounded_utf8_suffix(text, tail_budget)
+    )
+}
+
+fn bounded_utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    let mut end = 0;
+    for (index, character) in text.char_indices() {
+        let next = index + character.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &text[..end]
+}
+
+fn bounded_utf8_suffix(text: &str, max_bytes: usize) -> &str {
+    let mut start = text.len();
+    let mut used = 0;
+    for (index, character) in text.char_indices().rev() {
+        let width = character.len_utf8();
+        if used + width > max_bytes {
+            break;
+        }
+        used += width;
+        start = index;
+    }
+    &text[start..]
 }
 
 fn parse_exit_code(text: &str) -> Option<i32> {
@@ -344,6 +429,10 @@ fn publish_locked(record: &JobRecord) -> Result<()> {
     let temporary = directory.join(format!(".{base}.tmp"));
     let published = directory.join(format!("{base}.json"));
     let bytes = serde_json::to_vec_pretty(record)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_JOURNAL_SNAPSHOT_BYTES,
+        "job journal snapshot exceeds {MAX_JOURNAL_SNAPSHOT_BYTES} bytes"
+    );
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -375,6 +464,13 @@ fn load_latest_locked(session_id: &str, job_id: Uuid) -> Result<JobRecord> {
     let path = snapshots
         .pop()
         .with_context(|| format!("unknown job_id: {job_id}"))?;
+    let metadata = fs::metadata(&path)
+        .with_context(|| format!("cannot stat job journal {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.len() <= MAX_JOURNAL_SNAPSHOT_BYTES,
+        "job journal {} exceeds {MAX_JOURNAL_SNAPSHOT_BYTES} bytes",
+        path.display()
+    );
     let bytes =
         fs::read(&path).with_context(|| format!("cannot read job journal {}", path.display()))?;
     let record: JobRecord = serde_json::from_slice(&bytes)
@@ -550,6 +646,93 @@ mod tests {
             load(&session_id, job_id, false).unwrap().state,
             JobState::Stopped
         );
+        remove_session_for_tests(&session_id);
+    }
+
+    #[test]
+    fn stop_does_not_overwrite_completed_or_failed_terminal_results() {
+        for (exit_code, expected_state) in [(0, JobState::Completed), (7, JobState::Failed)] {
+            let session_id = format!("journal-terminal-stop-{}", Uuid::new_v4());
+            let job_id = Uuid::new_v4();
+            create_running(
+                &session_id,
+                job_id,
+                "terminal".to_owned(),
+                PathBuf::from("/workspace"),
+                ExecutionMode::Sandboxed,
+            )
+            .unwrap();
+            let finished =
+                finish(&session_id, job_id, &record_result(exit_code, "original")).unwrap();
+            let stopped = mark_stopped(&session_id, job_id).unwrap();
+
+            assert_eq!(stopped.state, expected_state);
+            assert_eq!(stopped.result, finished.result);
+            assert_eq!(stopped.error, finished.error);
+            assert_eq!(stopped.exit_code, finished.exit_code);
+            remove_session_for_tests(&session_id);
+        }
+    }
+
+    #[test]
+    fn persisted_result_and_error_payloads_and_snapshots_are_bounded() {
+        for exit_code in [0, 9] {
+            let session_id = format!("journal-bounded-{}", Uuid::new_v4());
+            let job_id = Uuid::new_v4();
+            create_running(
+                &session_id,
+                job_id,
+                "quoted command".repeat(10_000),
+                PathBuf::from("/workspace"),
+                ExecutionMode::Sandboxed,
+            )
+            .unwrap();
+            let noisy = "\\\"日本語🙂\n".repeat(200_000);
+            let record = finish(&session_id, job_id, &record_result(exit_code, &noisy)).unwrap();
+            let payload = record
+                .result
+                .as_ref()
+                .or(record.error.as_ref())
+                .expect("terminal record must contain a payload");
+
+            assert!(payload.contains("journal_truncated"));
+            assert!(payload.contains("original_bytes"));
+            assert!(
+                serde_json::to_vec(payload).unwrap().len() <= MAX_PERSISTED_FIELD_SERIALIZED_BYTES
+            );
+            assert!(
+                serde_json::to_vec(&record).unwrap().len() as u64 <= MAX_JOURNAL_SNAPSHOT_BYTES
+            );
+            assert_eq!(record.exit_code, Some(exit_code));
+            remove_session_for_tests(&session_id);
+        }
+    }
+
+    #[test]
+    fn oversized_snapshot_fails_closed_before_allocation() {
+        let session_id = format!("journal-oversized-{}", Uuid::new_v4());
+        let job_id = Uuid::new_v4();
+        create_running(
+            &session_id,
+            job_id,
+            "true".to_owned(),
+            PathBuf::from("/workspace"),
+            ExecutionMode::Sandboxed,
+        )
+        .unwrap();
+        let directory = job_root(&session_id, job_id).unwrap();
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        let path = directory.join(format!("{:039}-{}.json", now_nanos(), Uuid::new_v4()));
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_JOURNAL_SNAPSHOT_BYTES + 1).unwrap();
+
+        let error = load(&session_id, job_id, false).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
         remove_session_for_tests(&session_id);
     }
 
