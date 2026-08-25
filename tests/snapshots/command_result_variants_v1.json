@@ -1,0 +1,110 @@
+[
+  {
+    "schema_version": 1,
+    "ok": true,
+    "status": "running",
+    "error_kind": null,
+    "exit_code": null,
+    "retryable": false,
+    "job_id": "00000000-0000-4000-8000-000000000001",
+    "stdout": "",
+    "stderr": "",
+    "message": "Command is running as job 00000000-0000-4000-8000-000000000001."
+  },
+  {
+    "schema_version": 1,
+    "ok": true,
+    "status": "completed",
+    "error_kind": null,
+    "exit_code": 0,
+    "retryable": false,
+    "job_id": null,
+    "stdout": "ok\n",
+    "stderr": "",
+    "message": "Command completed successfully."
+  },
+  {
+    "schema_version": 1,
+    "ok": false,
+    "status": "failed",
+    "error_kind": "process_exit",
+    "exit_code": 2,
+    "retryable": false,
+    "job_id": null,
+    "stdout": "",
+    "stderr": "bad input\n",
+    "message": "Command exited with status 2."
+  },
+  {
+    "schema_version": 1,
+    "ok": false,
+    "status": "failed",
+    "error_kind": "spawn_error",
+    "exit_code": null,
+    "retryable": true,
+    "job_id": null,
+    "stdout": "",
+    "stderr": "",
+    "message": "Command could not be started: executable not found"
+  },
+  {
+    "schema_version": 1,
+    "ok": false,
+    "status": "failed",
+    "error_kind": "timeout",
+    "exit_code": null,
+    "retryable": true,
+    "job_id": null,
+    "stdout": "",
+    "stderr": "",
+    "message": "Command exceeded its execution deadline."
+  },
+  {
+    "schema_version": 1,
+    "ok": false,
+    "status": "stopped",
+    "error_kind": "cancellation",
+    "exit_code": null,
+    "retryable": true,
+    "job_id": "00000000-0000-4000-8000-000000000001",
+    "stdout": "",
+    "stderr": "",
+    "message": "Command was stopped."
+  },
+  {
+    "schema_version": 1,
+    "ok": false,
+    "status": "failed",
+    "error_kind": "approval_denied",
+    "exit_code": null,
+    "retryable": false,
+    "job_id": null,
+    "stdout": "",
+    "stderr": "",
+    "message": "Approval was denied; command was not started."
+  },
+  {
+    "schema_version": 1,
+    "ok": false,
+    "status": "failed",
+    "error_kind": "invalid_arguments",
+    "exit_code": null,
+    "retryable": false,
+    "job_id": null,
+    "stdout": "",
+    "stderr": "",
+    "message": "command must contain at least one argv entry"
+  },
+  {
+    "schema_version": 1,
+    "ok": false,
+    "status": "failed",
+    "error_kind": "internal",
+    "exit_code": null,
+    "retryable": true,
+    "job_id": null,
+    "stdout": "",
+    "stderr": "",
+    "message": "command task failed unexpectedly"
+  }
+]

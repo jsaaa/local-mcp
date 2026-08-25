@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::{approvals, config, sandbox};
+use crate::{approvals, command_result, command_result::CommandOutcome, config, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const HEARTBEAT_DEFAULT_NAME: &str = "default";
@@ -148,7 +148,7 @@ const IMAGE_VIEWER_HTML: &str = r#"<!doctype html>
 struct Job {
     session_id: String,
     command: String,
-    handle: JoinHandle<Result<String>>,
+    handle: JoinHandle<CommandOutcome>,
 }
 
 fn jobs() -> &'static Mutex<HashMap<Uuid, Job>> {
@@ -325,6 +325,12 @@ fn tools() -> Value {
             .and_then(Value::as_object_mut)
         {
             session_id.remove("format");
+        }
+        if matches!(
+            tool.get("name").and_then(Value::as_str),
+            Some("execute" | "start_command" | "poll_job" | "stop_job" | "without_sandbox")
+        ) {
+            tool["outputSchema"] = command_result::output_schema();
         }
     }
     tools
@@ -737,17 +743,25 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
 }
 
 async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, mut handle) = spawn_sandboxed_command("execute", args, session).await?;
+    let (rendered_command, mut handle) =
+        match spawn_sandboxed_command("execute", args, session).await {
+            Ok(launch) => launch,
+            Err(outcome) => return Ok(outcome.tool_result()),
+        };
 
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
-        Ok(joined) => text_result(joined.context("command task failed")??),
+        Ok(Ok(outcome)) => Ok(outcome.tool_result()),
+        Ok(Err(error)) => Ok(join_error_outcome(error, None).tool_result()),
         Err(_) => store_job(session, rendered_command, handle, "Backgrounded").await,
     }
 }
 
 async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
     let (rendered_command, handle) =
-        spawn_sandboxed_command("start_command", args, session).await?;
+        match spawn_sandboxed_command("start_command", args, session).await {
+            Ok(launch) => launch,
+            Err(outcome) => return Ok(outcome.tool_result()),
+        };
     store_job(session, rendered_command, handle, "Started").await
 }
 
@@ -755,19 +769,28 @@ async fn spawn_sandboxed_command(
     operation: &str,
     args: &Value,
     session: &config::Session,
-) -> Result<(String, JoinHandle<Result<String>>)> {
-    let command = required_command(args)?;
-    let cwd = cwd(args, &session.cwd)?;
+) -> std::result::Result<(String, JoinHandle<CommandOutcome>), CommandOutcome> {
+    let (command, cwd) = command_invocation(args, session)?;
     #[cfg(windows)]
-    if !approvals::request(
+    match approvals::request(
         &session.id,
         operation,
         format!("argv: {command:?}"),
         cwd.clone(),
     )
-    .await?
+    .await
     {
-        anyhow::bail!("user denied {operation}")
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(CommandOutcome::approval_denied(format!(
+                "Approval was denied; {operation} did not start the command."
+            )));
+        }
+        Err(error) => {
+            return Err(CommandOutcome::internal(format!(
+                "Approval request failed: {error:#}"
+            )));
+        }
     }
     #[cfg(not(windows))]
     let _ = operation;
@@ -780,11 +803,12 @@ async fn spawn_sandboxed_command(
     let session_id = session.id.clone();
     let task_command = rendered_command.clone();
     let handle = tokio::spawn(async move {
-        let result = sandbox::run(&command, &cwd, &roots, None)
-            .await
-            .and_then(render_output);
-        report_command_finished(session_id, &task_command, &result).await;
-        result
+        let outcome = match sandbox::run(&command, &cwd, &roots, None).await {
+            Ok(output) => CommandOutcome::from_output(output),
+            Err(error) => CommandOutcome::spawn_error(format!("{error:#}")),
+        };
+        report_command_finished(session_id, &task_command, &outcome).await;
+        outcome
     });
     Ok((rendered_command, handle))
 }
@@ -792,7 +816,7 @@ async fn spawn_sandboxed_command(
 async fn store_job(
     session: &config::Session,
     rendered_command: String,
-    handle: JoinHandle<Result<String>>,
+    handle: JoinHandle<CommandOutcome>,
     activity: &str,
 ) -> Result<Value> {
     let job_id = Uuid::new_v4();
@@ -810,49 +834,98 @@ async fn store_job(
         Some(format!("└ job {job_id}")),
     )
     .await;
-    text_result(json!({"status":"running","job_id":job_id}).to_string())
+    Ok(CommandOutcome::running(job_id).tool_result())
 }
 
 async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
-    let job_id = required_job_id(args)?;
+    let job_id = match required_job_id(args) {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            return Ok(CommandOutcome::invalid_arguments(format!("{error:#}")).tool_result());
+        }
+    };
     let finished = {
         let jobs = jobs().lock().unwrap();
-        let job = jobs.get(&job_id).context("unknown job_id")?;
-        anyhow::ensure!(
-            job.session_id == session.id,
-            "job does not belong to this session"
-        );
+        let Some(job) = jobs.get(&job_id) else {
+            return Ok(
+                CommandOutcome::invalid_arguments(format!("unknown job_id: {job_id}"))
+                    .tool_result(),
+            );
+        };
+        if job.session_id != session.id {
+            return Ok(
+                CommandOutcome::invalid_arguments("job does not belong to this session")
+                    .tool_result(),
+            );
+        }
         job.handle.is_finished()
     };
     if !finished {
-        return text_result(json!({"status":"running","job_id":job_id}).to_string());
+        return Ok(CommandOutcome::running(job_id).tool_result());
     }
 
     let job = jobs().lock().unwrap().remove(&job_id).unwrap();
-    let result = job.handle.await.context("background command task failed")?;
-    text_result(result?)
+    let outcome = match job.handle.await {
+        Ok(outcome) => outcome.with_job_id(job_id),
+        Err(error) => join_error_outcome(error, Some(job_id)),
+    };
+    Ok(outcome.tool_result())
 }
 
 async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
-    let job_id = required_job_id(args)?;
+    let job_id = match required_job_id(args) {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            return Ok(CommandOutcome::invalid_arguments(format!("{error:#}")).tool_result());
+        }
+    };
     let job = {
         let mut jobs = jobs().lock().unwrap();
-        let job = jobs.get(&job_id).context("unknown job_id")?;
-        anyhow::ensure!(
-            job.session_id == session.id,
-            "job does not belong to this session"
-        );
+        let Some(job) = jobs.get(&job_id) else {
+            return Ok(
+                CommandOutcome::invalid_arguments(format!("unknown job_id: {job_id}"))
+                    .tool_result(),
+            );
+        };
+        if job.session_id != session.id {
+            return Ok(
+                CommandOutcome::invalid_arguments("job does not belong to this session")
+                    .tool_result(),
+            );
+        }
         jobs.remove(&job_id).unwrap()
     };
-    job.handle.abort();
-    let _ = job.handle.await;
+
+    let command = job.command.clone();
+    let outcome = if job.handle.is_finished() {
+        match job.handle.await {
+            Ok(outcome) => outcome.with_job_id(job_id),
+            Err(error) => join_error_outcome(error, Some(job_id)),
+        }
+    } else {
+        job.handle.abort();
+        let _ = job.handle.await;
+        CommandOutcome::cancellation(Some(job_id), "Command was stopped by request.")
+    };
     approvals::activity(
         &session.id,
-        format!("Stopped {}", job.command),
+        format!("Stopped {command}"),
         Some(format!("└ job {job_id}")),
     )
     .await;
-    text_result(json!({"status":"stopped","job_id":job_id}).to_string())
+    Ok(outcome.tool_result())
+}
+
+fn join_error_outcome(error: tokio::task::JoinError, job_id: Option<Uuid>) -> CommandOutcome {
+    if error.is_cancelled() {
+        CommandOutcome::cancellation(job_id, "Command task was cancelled.")
+    } else {
+        let outcome = CommandOutcome::internal(format!("Command task failed: {error}"));
+        match job_id {
+            Some(job_id) => outcome.with_job_id(job_id),
+            None => outcome,
+        }
+    }
 }
 
 fn required_job_id(args: &Value) -> Result<Uuid> {
@@ -876,18 +949,48 @@ fn required_command(args: &Value) -> Result<Vec<String>> {
         .collect()
 }
 
+fn command_invocation(
+    args: &Value,
+    session: &config::Session,
+) -> std::result::Result<(Vec<String>, PathBuf), CommandOutcome> {
+    let command = required_command(args)
+        .map_err(|error| CommandOutcome::invalid_arguments(format!("{error:#}")))?;
+    if command.is_empty() {
+        return Err(CommandOutcome::invalid_arguments(
+            "command must contain at least one argv entry",
+        ));
+    }
+    let cwd = cwd(args, &session.cwd)
+        .map_err(|error| CommandOutcome::invalid_arguments(format!("{error:#}")))?;
+    Ok((command, cwd))
+}
+
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
-    let command = required_command(args)?;
-    let cwd = cwd(args, &session.cwd)?;
-    if !approvals::request(
+    let (command, cwd) = match command_invocation(args, session) {
+        Ok(invocation) => invocation,
+        Err(outcome) => return Ok(outcome.tool_result()),
+    };
+    match approvals::request(
         &session.id,
         "without_sandbox",
         format!("argv: {command:?}"),
         cwd.clone(),
     )
-    .await?
+    .await
     {
-        anyhow::bail!("user denied without_sandbox")
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(CommandOutcome::approval_denied(
+                "Approval was denied; unrestricted command was not started.",
+            )
+            .tool_result());
+        }
+        Err(error) => {
+            return Ok(
+                CommandOutcome::internal(format!("Approval request failed: {error:#}"))
+                    .tool_result(),
+            );
+        }
     }
     run_and_report(session.id.clone(), command, cwd, true, &[]).await
 }
@@ -906,9 +1009,12 @@ async fn run_and_report(
     } else {
         sandbox::run(&command, &cwd, roots, None).await
     };
-    let result = output.and_then(render_output);
-    report_command_finished(session_id, &rendered_command, &result).await;
-    text_result(result?)
+    let outcome = match output {
+        Ok(output) => CommandOutcome::from_output(output),
+        Err(error) => CommandOutcome::spawn_error(format!("{error:#}")),
+    };
+    report_command_finished(session_id, &rendered_command, &outcome).await;
+    Ok(outcome.tool_result())
 }
 
 fn render_command(command: &[String]) -> String {
@@ -919,11 +1025,8 @@ fn render_command(command: &[String]) -> String {
         .join(" ")
 }
 
-async fn report_command_finished(session_id: String, command: &str, result: &Result<String>) {
-    let detail = match result {
-        Ok(text) => command_summary(text),
-        Err(error) => Some(format!("└ Error: {error:#}")),
-    };
+async fn report_command_finished(session_id: String, command: &str, outcome: &CommandOutcome) {
+    let detail = command_summary(&outcome.fallback_text());
     approvals::activity(&session_id, format!("Ran {command}"), detail).await;
 }
 
@@ -939,24 +1042,12 @@ fn shell_word(value: &str) -> String {
 }
 
 fn command_summary(text: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(text).ok()?;
-    let stdout = value
-        .get("stdout")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim_end();
-    let stderr = value
-        .get("stderr")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim_end();
-    let output = if stdout.is_empty() { stderr } else { stdout };
-    if output.is_empty() {
+    let text = text.trim_end();
+    if text.is_empty() {
         None
     } else {
         Some(
-            output
-                .lines()
+            text.lines()
                 .map(|line| format!("└ {line}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -1130,6 +1221,214 @@ mod tests {
     fn rejects_unknown_ui_resource() {
         let error = read_resource(&json!({"uri": "ui://local-mcp/unknown.html"})).unwrap_err();
         assert!(error.to_string().contains("unknown resource"));
+    }
+
+    #[test]
+    fn every_command_tool_declares_the_versioned_output_schema() {
+        let tools = tools();
+        for name in [
+            "execute",
+            "start_command",
+            "poll_job",
+            "stop_job",
+            "without_sandbox",
+        ] {
+            let tool = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert_eq!(tool["outputSchema"], command_result::output_schema());
+        }
+    }
+
+    fn test_session(directory: &Path) -> config::Session {
+        config::Session {
+            id: format!("command-result-test-{}", Uuid::new_v4()),
+            cwd: directory.to_owned(),
+            permitted_directories: vec![directory.to_owned()],
+        }
+    }
+
+    fn structured(result: &Value) -> &Value {
+        result
+            .get("structuredContent")
+            .expect("missing structuredContent")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_process_exit_is_a_normal_structured_tool_result() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-result-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = test_session(&directory);
+        let result = run_and_report(
+            session.id.clone(),
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf output; printf failure >&2; exit 2".to_owned(),
+            ],
+            directory.clone(),
+            true,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(structured(&result)["error_kind"], "process_exit");
+        assert_eq!(structured(&result)["exit_code"], 2);
+        assert_eq!(structured(&result)["stdout"], "output");
+        assert_eq!(structured(&result)["stderr"], "failure");
+        assert_eq!(result["isError"], true);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_failure_is_a_structured_outcome() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-result-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = test_session(&directory);
+        let executable = format!("missing-local-mcp-executable-{}", Uuid::new_v4());
+        let result = run_and_report(
+            session.id.clone(),
+            vec![executable],
+            directory.clone(),
+            true,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(structured(&result)["error_kind"], "spawn_error");
+        assert_eq!(structured(&result)["retryable"], true);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_command_arguments_are_structured() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-result-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = test_session(&directory);
+
+        let missing = execute(&json!({}), &session).await.unwrap();
+        assert_eq!(structured(&missing)["error_kind"], "invalid_arguments");
+        let empty = execute(&json!({"command": []}), &session).await.unwrap();
+        assert_eq!(structured(&empty)["error_kind"], "invalid_arguments");
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_poll_returns_the_same_structured_schema() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-result-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = test_session(&directory);
+        let job_id = Uuid::new_v4();
+        let handle = tokio::spawn(async {
+            CommandOutcome::from_output(sandbox::Output {
+                status: 0,
+                stdout: "background complete".to_owned(),
+                stderr: String::new(),
+            })
+        });
+        jobs().lock().unwrap().insert(
+            job_id,
+            Job {
+                session_id: session.id.clone(),
+                command: "synthetic background command".to_owned(),
+                handle,
+            },
+        );
+        tokio::task::yield_now().await;
+
+        let result = poll_job(&json!({"job_id": job_id.to_string()}), &session)
+            .await
+            .unwrap();
+        assert_eq!(structured(&result)["status"], "completed");
+        assert_eq!(structured(&result)["job_id"], job_id.to_string());
+        assert_eq!(structured(&result)["stdout"], "background complete");
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_returns_a_structured_cancellation() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-result-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = test_session(&directory);
+        let job_id = Uuid::new_v4();
+        let handle = tokio::spawn(async { std::future::pending::<CommandOutcome>().await });
+        jobs().lock().unwrap().insert(
+            job_id,
+            Job {
+                session_id: session.id.clone(),
+                command: "synthetic pending command".to_owned(),
+                handle,
+            },
+        );
+
+        let result = stop_job(&json!({"job_id": job_id.to_string()}), &session)
+            .await
+            .unwrap();
+        assert_eq!(structured(&result)["status"], "stopped");
+        assert_eq!(structured(&result)["error_kind"], "cancellation");
+        assert_eq!(structured(&result)["job_id"], job_id.to_string());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn start_approval_responder(
+        session_id: &str,
+        response: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::net::UnixListener;
+
+        let path = config::socket_path(session_id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            assert!(line.contains("without_sandbox"));
+            stream
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn denied_approval_is_structured_and_never_starts_the_command() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-result-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = test_session(&directory);
+        let marker = directory.join("must-not-exist");
+        let responder = start_approval_responder(&session.id, "deny").await;
+
+        let result = without_sandbox(
+            &json!({
+                "command": ["sh", "-c", format!("printf started > {}", marker.display())]
+            }),
+            &session,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(structured(&result)["error_kind"], "approval_denied");
+        assert_eq!(structured(&result)["status"], "failed");
+        assert!(!marker.exists());
+        let _ = tokio::fs::remove_file(config::socket_path(&session.id).unwrap()).await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[test]

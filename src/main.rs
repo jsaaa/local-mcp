@@ -1,4 +1,5 @@
 mod approvals;
+mod command_result;
 mod config;
 mod mcp;
 mod sandbox;

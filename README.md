@@ -96,6 +96,46 @@ to check for completion or `stop_job` to terminate them. Use `start_command`
 when a command should run in the background immediately without the 30-second
 foreground wait.
 
+### Structured command results
+
+`execute`, `start_command`, `poll_job`, `stop_job`, and `without_sandbox` return a
+versioned command result in MCP `structuredContent`. Their `tools/list` entries
+also publish the corresponding `outputSchema`. The current schema version is
+`1` and has these stable fields:
+
+```json
+{
+  "schema_version": 1,
+  "ok": false,
+  "status": "failed",
+  "error_kind": "process_exit",
+  "exit_code": 2,
+  "retryable": false,
+  "job_id": null,
+  "stdout": "",
+  "stderr": "invalid input
+",
+  "message": "Command exited with status 2."
+}
+```
+
+`status` is one of `running`, `completed`, `failed`, or `stopped`.
+`error_kind` is null for successful/running outcomes, or one of
+`process_exit`, `spawn_error`, `timeout`, `cancellation`, `approval_denied`,
+`invalid_arguments`, and `internal`. A non-zero child exit, a denied approval,
+and other expected command-lifecycle failures are ordinary MCP tool results;
+they may set MCP `isError`, but they do not become JSON-RPC transport errors or
+JSON strings nested inside an error message. Protocol framing failures, an
+unknown tool, an invalid/missing session ID, and faults outside a command
+lifecycle can still be returned as MCP/JSON-RPC errors.
+
+The `content` array remains present and contains a human-readable fallback with
+the message and any stdout/stderr, so clients that ignore `structuredContent`
+continue to show useful output. Consumers should branch on `schema_version`
+before relying on fields. Additive, backward-compatible clarifications may keep
+the same version; removing fields, changing their types or meanings, or changing
+enum semantics requires a new version and output schema.
+
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
 available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands use

@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LocalMcpCommandResultV1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "stopped"
+      ]
+    },
+    "error_kind": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "enum": [
+            "process_exit",
+            "spawn_error",
+            "timeout",
+            "cancellation",
+            "approval_denied",
+            "invalid_arguments",
+            "internal"
+          ]
+        }
+      ]
+    },
+    "exit_code": {
+      "oneOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "job_id": {
+      "oneOf": [
+        {
+          "type": "string",
+          "format": "uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "stdout": {
+      "type": "string"
+    },
+    "stderr": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "ok",
+    "status",
+    "error_kind",
+    "exit_code",
+    "retryable",
+    "job_id",
+    "stdout",
+    "stderr",
+    "message"
+  ]
+}
