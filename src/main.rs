@@ -1,5 +1,6 @@
 mod approvals;
 mod config;
+mod job_journal;
 mod mcp;
 mod sandbox;
 

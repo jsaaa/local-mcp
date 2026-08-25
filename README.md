@@ -96,6 +96,42 @@ to check for completion or `stop_job` to terminate them. Use `start_command`
 when a command should run in the background immediately without the 30-second
 foreground wait.
 
+### Persistent job journal
+
+Command lifecycle metadata is persisted below local-mcp's state directory in a
+session-scoped journal. Each update is first written to a unique temporary file,
+flushed, and atomically renamed to a versioned JSON snapshot. A partial temporary
+write is ignored and cleaned up; a corrupt latest snapshot fails closed for that
+job instead of silently falling back to stale state or preventing the MCP server
+from starting.
+
+`poll_job` first checks the live in-memory handle. If that handle was lost across
+an MCP server restart, it loads the persisted result. Completed and failed
+results therefore remain available after restart. A record that was still
+`running` but has no live handle is explicitly changed to `orphaned`; local-mcp
+does not claim that it can reattach to an arbitrary process. The first journal
+format records the server PID and reserves a process-ID field, but current
+sandbox execution does not expose a safely reattachable process identity, so
+`process_id` is null and `reattachable` is false.
+
+Use `list_jobs` to recover IDs or inspect state after a lost response:
+
+```json
+{
+  "session_id": "...",
+  "state": "completed",
+  "offset": 0,
+  "limit": 50
+}
+```
+
+The state filter accepts `running`, `completed`, `failed`, `stopped`, and
+`orphaned`; `limit` is capped at 100. Journal lookup and listing are isolated by
+session ID. Terminal records older than 30 days are removed, and each session is
+bounded to 256 records; running records are not deleted merely to satisfy the
+count limit. Corrupt entries are omitted from a list response and counted in its
+`corrupt_entries` field.
+
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
 available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands use
