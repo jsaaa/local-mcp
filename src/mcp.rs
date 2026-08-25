@@ -317,7 +317,8 @@ fn tools() -> Value {
         {"name":"heartbeat_wait","description":"Wait for the next heartbeat tick in short long-poll chunks. Call this repeatedly until status is tick, then do one work cycle and call it again. If a scheduled tick passes while no heartbeat_wait call is active because the agent is still working, that tick is skipped. This does not revive a ChatGPT turn after the turn has ended.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"max_wait_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["session_id"],"additionalProperties":false}},
         {"name":"heartbeat_status","description":"Show the current in-turn heartbeat schedule, delivered tick count, skipped tick count, and time until the next tick.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
         {"name":"heartbeat_stop","description":"Stop and remove an in-turn heartbeat schedule for this local-mcp session.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
+        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode. Returns the normal result within 30 seconds; longer commands continue as jobs for poll_job or stop_job.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
+        {"name":"start_without_sandbox","description":"After approval, start argv immediately as an unrestricted host background job and return a job_id. The process has full host permissions and network access; denial never starts a process or creates a job.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
     ]);
     for tool in tools.as_array_mut().unwrap() {
         if let Some(session_id) = tool
@@ -391,6 +392,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
         "heartbeat_status" => heartbeat_status(&args, &session).await,
         "heartbeat_stop" => heartbeat_stop(&args, &session).await,
         "without_sandbox" => without_sandbox(&args, &session).await,
+        "start_without_sandbox" => start_without_sandbox(&args, &session).await,
         _ => anyhow::bail!("unknown tool: {name}"),
     }
 }
@@ -877,38 +879,59 @@ fn required_command(args: &Value) -> Result<Vec<String>> {
 }
 
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
+    without_sandbox_with_timeout(args, session, FOREGROUND_TIMEOUT).await
+}
+
+async fn without_sandbox_with_timeout(
+    args: &Value,
+    session: &config::Session,
+    foreground_timeout: Duration,
+) -> Result<Value> {
+    let (rendered_command, mut handle) =
+        spawn_unrestricted_command("without_sandbox", args, session).await?;
+
+    match tokio::time::timeout(foreground_timeout, &mut handle).await {
+        Ok(joined) => text_result(joined.context("unrestricted command task failed")??),
+        Err(_) => store_job(session, rendered_command, handle, "Backgrounded").await,
+    }
+}
+
+async fn start_without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
+    let (rendered_command, handle) =
+        spawn_unrestricted_command("start_without_sandbox", args, session).await?;
+    store_job(session, rendered_command, handle, "Started").await
+}
+
+async fn spawn_unrestricted_command(
+    operation: &str,
+    args: &Value,
+    session: &config::Session,
+) -> Result<(String, JoinHandle<Result<String>>)> {
     let command = required_command(args)?;
     let cwd = cwd(args, &session.cwd)?;
     if !approvals::request(
         &session.id,
-        "without_sandbox",
+        operation,
         format!("argv: {command:?}"),
         cwd.clone(),
     )
     .await?
     {
-        anyhow::bail!("user denied without_sandbox")
+        anyhow::bail!("user denied {operation}")
     }
-    run_and_report(session.id.clone(), command, cwd, true, &[]).await
-}
 
-async fn run_and_report(
-    session_id: String,
-    command: Vec<String>,
-    cwd: PathBuf,
-    unrestricted: bool,
-    roots: &[PathBuf],
-) -> Result<Value> {
     let rendered_command = render_command(&command);
-    approvals::activity(&session_id, format!("Running {rendered_command}"), None).await;
-    let output = if unrestricted {
-        sandbox::run_unrestricted(&command, &cwd, None).await
-    } else {
-        sandbox::run(&command, &cwd, roots, None).await
-    };
-    let result = output.and_then(render_output);
-    report_command_finished(session_id, &rendered_command, &result).await;
-    text_result(result?)
+    approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+    let session_id = session.id.clone();
+    let task_command = rendered_command.clone();
+    let handle = tokio::spawn(async move {
+        let result = sandbox::run_unrestricted(&command, &cwd, None)
+            .await
+            .and_then(render_output);
+        report_command_finished(session_id, &task_command, &result).await;
+        result
+    });
+    Ok((rendered_command, handle))
 }
 
 fn render_command(command: &[String]) -> String {
@@ -1130,6 +1153,208 @@ mod tests {
     fn rejects_unknown_ui_resource() {
         let error = read_resource(&json!({"uri": "ui://local-mcp/unknown.html"})).unwrap_err();
         assert!(error.to_string().contains("unknown resource"));
+    }
+
+    #[test]
+    fn unrestricted_background_tool_is_declared() {
+        let tools = tools();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "start_without_sandbox")
+            .unwrap();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["command"]["type"],
+            "array"
+        );
+        assert!(
+            tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("denial never starts")
+        );
+    }
+
+    #[cfg(unix)]
+    async fn start_unrestricted_approval_responder(
+        session_id: &str,
+        operation: &'static str,
+        response: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::net::UnixListener;
+
+        let path = config::socket_path(session_id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            assert!(line.contains(operation));
+            stream
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    fn unrestricted_test_session(directory: &Path) -> config::Session {
+        config::Session {
+            id: format!("unrestricted-test-{}", Uuid::new_v4()),
+            cwd: directory.to_owned(),
+            permitted_directories: vec![directory.to_owned()],
+        }
+    }
+
+    fn result_job_id(result: &Value) -> Uuid {
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let envelope: Value = serde_json::from_str(text).unwrap();
+        Uuid::parse_str(envelope["job_id"].as_str().unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_job(job_id: Uuid, session: &config::Session) -> Value {
+        for _ in 0..100 {
+            let result = poll_job(&json!({"job_id": job_id.to_string()}), session)
+                .await
+                .unwrap();
+            let text = result["content"][0]["text"].as_str().unwrap();
+            if !text.contains("\"status\":\"running\"") {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("job did not finish");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn denied_unrestricted_approval_does_not_start_or_create_a_job() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-unrestricted-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let marker = directory.join("denied-marker");
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "start_without_sandbox", "deny")
+                .await;
+
+        let error = start_without_sandbox(
+            &json!({
+                "command": ["sh", "-c", format!("printf started > {}", marker.display())]
+            }),
+            &session,
+        )
+        .await
+        .unwrap_err();
+        responder.await.unwrap();
+
+        assert!(error.to_string().contains("user denied"));
+        assert!(!marker.exists());
+        let _ = tokio::fs::remove_file(config::socket_path(&session.id).unwrap()).await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_foreground_command_returns_normal_result() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-unrestricted-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "without_sandbox", "allow").await;
+
+        let result = without_sandbox_with_timeout(
+            &json!({"command": ["sh", "-c", "printf complete > foreground.txt"]}),
+            &session,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"exit_code\":0")
+        );
+        assert!(directory.join("foreground.txt").is_file());
+        let _ = tokio::fs::remove_file(config::socket_path(&session.id).unwrap()).await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_foreground_timeout_auto_backgrounds() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-unrestricted-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "without_sandbox", "allow").await;
+
+        let running = without_sandbox_with_timeout(
+            &json!({"command": ["sh", "-c", "sleep 0.1; printf complete > auto.txt"]}),
+            &session,
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+        let job_id = result_job_id(&running);
+        let completed = wait_for_job(job_id, &session).await;
+
+        assert!(
+            completed["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"exit_code\":0")
+        );
+        assert!(directory.join("auto.txt").is_file());
+        let _ = tokio::fs::remove_file(config::socket_path(&session.id).unwrap()).await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_unrestricted_background_job_can_be_polled() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-unrestricted-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "start_without_sandbox", "allow")
+                .await;
+
+        let running = start_without_sandbox(
+            &json!({"command": ["sh", "-c", "sleep 0.05; printf complete > explicit.txt"]}),
+            &session,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+        let job_id = result_job_id(&running);
+        let completed = wait_for_job(job_id, &session).await;
+
+        assert!(
+            completed["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"exit_code\":0")
+        );
+        assert!(directory.join("explicit.txt").is_file());
+        let _ = tokio::fs::remove_file(config::socket_path(&session.id).unwrap()).await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[test]

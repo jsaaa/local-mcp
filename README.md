@@ -90,11 +90,21 @@ and pending approvals do not use polling timers.
 The `start` screen also receives live activity from MCP calls. It shows file and
 image reads, directory listings, file edits with unified diffs and line counts,
 and command start/completion with output, in a compact Codex-style timeline.
-`execute` returns its normal result for commands that finish within 30 seconds.
-Longer commands continue in the background and return a `job_id`; use `poll_job`
-to check for completion or `stop_job` to terminate them. Use `start_command`
-when a command should run in the background immediately without the 30-second
-foreground wait.
+`execute` returns its normal result for sandboxed commands that finish within 30
+seconds. Longer commands continue in the background and return a `job_id`; use
+`poll_job` to check for completion or `stop_job` to stop them. Use `start_command`
+when a sandboxed command should run in the background immediately.
+
+Unrestricted execution has the same lifecycle. `without_sandbox` requests
+approval before launching, returns a normal result within 30 seconds, and
+automatically returns a `job_id` if the approved process is still running.
+`start_without_sandbox` requests approval and then starts the unrestricted job in
+the background immediately. Approval is always completed before process spawn;
+a denied request creates no process and no job. Both kinds of unrestricted jobs
+remain owned by the originating session and are polled or stopped with the same
+`poll_job` and `stop_job` tools. Yolo mode skips the prompt but does not change
+job behavior or session ownership. Unrestricted background jobs retain the
+service user's full filesystem and network permissions for their entire lifetime.
 
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
