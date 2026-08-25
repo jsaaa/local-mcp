@@ -18,6 +18,7 @@ pub enum StopTrigger {
     Requested,
     Timeout,
     Cancellation,
+    Completion,
 }
 
 impl StopTrigger {
@@ -26,6 +27,7 @@ impl StopTrigger {
             Self::Requested => "stop",
             Self::Timeout => "timeout",
             Self::Cancellation => "cancellation",
+            Self::Completion => "completion",
         }
     }
 }
@@ -279,8 +281,13 @@ async fn run_process(
     let (status, termination) = match event {
         WaitEvent::Exited(status) => {
             let status = status.context("failed to wait for command")?;
-            tree.disarm();
-            (status, Termination::Exited)
+            let forced_cleanup = tree.cleanup_after_direct_exit(false).await;
+            let termination = if forced_cleanup {
+                Termination::ForcedKill(StopTrigger::Completion)
+            } else {
+                Termination::Exited
+            };
+            (status, termination)
         }
         WaitEvent::Triggered(trigger) => terminate_and_reap(&mut child, &mut tree, trigger).await?,
     };
@@ -352,8 +359,13 @@ async fn terminate_and_reap(
     match tokio::time::timeout(TERMINATION_GRACE, child.wait()).await {
         Ok(status) => {
             let status = status.context("failed to reap terminated command")?;
-            tree.disarm();
-            Ok((status, graceful_termination(trigger)))
+            let forced_cleanup = tree.cleanup_after_direct_exit(true).await;
+            let termination = if forced_cleanup {
+                Termination::ForcedKill(trigger)
+            } else {
+                graceful_termination(trigger)
+            };
+            Ok((status, termination))
         }
         Err(_) => {
             tree.force().await;
@@ -362,7 +374,7 @@ async fn terminate_and_reap(
                 .wait()
                 .await
                 .context("failed to reap force-killed command")?;
-            tree.disarm();
+            tree.finish_forced_cleanup().await;
             Ok((status, Termination::ForcedKill(trigger)))
         }
     }
@@ -373,6 +385,7 @@ fn graceful_termination(trigger: StopTrigger) -> Termination {
         StopTrigger::Requested => Termination::Stopped,
         StopTrigger::Timeout => Termination::TimedOut,
         StopTrigger::Cancellation => Termination::Cancelled,
+        StopTrigger::Completion => Termination::Exited,
     }
 }
 
@@ -404,6 +417,52 @@ impl ProcessTreeGuard {
             terminate_tree_async(self.process_id, true).await;
         }
     }
+
+    async fn cleanup_after_direct_exit(&mut self, graceful_already_requested: bool) -> bool {
+        #[cfg(unix)]
+        {
+            if !unix_process_group_exists(self.process_id) {
+                self.disarm();
+                return false;
+            }
+            if !graceful_already_requested {
+                self.request_graceful().await;
+            }
+            if wait_for_unix_process_group_exit(self.process_id, TERMINATION_GRACE).await {
+                self.disarm();
+                return false;
+            }
+            self.force().await;
+            let _ = wait_for_unix_process_group_exit(self.process_id, TERMINATION_GRACE).await;
+            self.disarm();
+            true
+        }
+        #[cfg(windows)]
+        {
+            // taskkill /T is best-effort after the direct process has exited. It
+            // still walks the recorded parent tree on supported Windows builds.
+            if !graceful_already_requested {
+                self.request_graceful().await;
+            }
+            self.force().await;
+            self.disarm();
+            false
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = graceful_already_requested;
+            self.disarm();
+            false
+        }
+    }
+
+    async fn finish_forced_cleanup(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = wait_for_unix_process_group_exit(self.process_id, TERMINATION_GRACE).await;
+        }
+        self.disarm();
+    }
 }
 
 impl Drop for ProcessTreeGuard {
@@ -424,6 +483,33 @@ fn configure_process_group(_process: &mut Command) {}
 
 #[cfg(not(any(unix, windows)))]
 fn configure_process_group(_process: &mut Command) {}
+
+#[cfg(unix)]
+fn unix_process_group_exists(process_id: u32) -> bool {
+    let Ok(group_id) = i32::try_from(process_id) else {
+        return false;
+    };
+    let result = unsafe { libc::kill(-group_id, 0) };
+    if result == 0 {
+        true
+    } else {
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_unix_process_group_exit(process_id: u32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !unix_process_group_exists(process_id) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 #[cfg(unix)]
 async fn terminate_tree_async(process_id: u32, force: bool) {
@@ -563,6 +649,27 @@ mod process_tree_tests {
         ]
     }
 
+    fn parent_exits_first_command(pid_file: &Path, ignore_term: bool) -> Vec<String> {
+        let ready_file = pid_file.with_extension("ready");
+        let ignored_signals = if ignore_term { "HUP TERM" } else { "HUP" };
+        let child = format!(
+            "sh -c 'trap \"\" {ignored_signals}; printf ready > \"{}\"; exec sleep 30'",
+            ready_file.display()
+        );
+        let wait_until_ready = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; ",
+            ready_file.display()
+        );
+        vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "{child} >/dev/null 2>&1 & child=$!; {wait_until_ready}printf '%s %s\\n' $$ $child > '{}'; exit 0",
+                pid_file.display()
+            ),
+        ]
+    }
+
     #[tokio::test]
     async fn normal_exit_is_distinct_from_lifecycle_termination() {
         let directory = test_directory();
@@ -581,6 +688,47 @@ mod process_tree_tests {
 
         assert_eq!(output.status, 0);
         assert_eq!(output.termination, Termination::Exited);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_parent_exit_cleans_up_background_descendants_before_returning() {
+        let directory = test_directory();
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let pid_file = directory.join("pids");
+        let command = parent_exits_first_command(&pid_file, false);
+        let (control, cancellation) = command_control();
+        let output = run_unrestricted_controlled(&command, &directory, None, cancellation, None)
+            .await
+            .unwrap();
+        drop(control);
+        let process_ids = wait_for_pids(&pid_file).await;
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.termination, Termination::Exited);
+        wait_until_gone([process_ids.0, process_ids.1]).await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_parent_exit_force_kills_descendant_that_ignores_term() {
+        let directory = test_directory();
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let pid_file = directory.join("pids");
+        let command = parent_exits_first_command(&pid_file, true);
+        let (control, cancellation) = command_control();
+        let output = run_unrestricted_controlled(&command, &directory, None, cancellation, None)
+            .await
+            .unwrap();
+        drop(control);
+        let process_ids = wait_for_pids(&pid_file).await;
+
+        assert_eq!(output.status, 0);
+        assert_eq!(
+            output.termination,
+            Termination::ForcedKill(StopTrigger::Completion)
+        );
+        wait_until_gone([process_ids.0, process_ids.1]).await;
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

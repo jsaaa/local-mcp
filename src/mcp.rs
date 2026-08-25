@@ -1116,6 +1116,19 @@ mod tests {
     }
 
     #[test]
+    fn renders_forced_completion_cleanup_as_an_inspectable_result() {
+        let rendered = render_output(sandbox::Output {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            termination: sandbox::Termination::ForcedKill(sandbox::StopTrigger::Completion),
+        })
+        .unwrap();
+        assert!(rendered.contains("\"termination\":\"forced_kill\""));
+        assert!(rendered.contains("\"termination_trigger\":\"completion\""));
+    }
+
+    #[test]
     fn quotes_command_arguments_for_activity_display() {
         assert_eq!(shell_word("README.md"), "README.md");
         assert_eq!(shell_word("hello world"), "\"hello world\"");
