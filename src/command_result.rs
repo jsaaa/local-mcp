@@ -20,7 +20,6 @@ pub enum CommandStatus {
 pub enum CommandErrorKind {
     ProcessExit,
     SpawnError,
-    Timeout,
     Cancellation,
     ApprovalDenied,
     InvalidArguments,
@@ -91,10 +90,6 @@ impl CommandOutcome {
             true,
             format!("Command could not be started: {message}"),
         )
-    }
-
-    pub fn timeout(message: impl Into<String>) -> Self {
-        Self::failure(CommandErrorKind::Timeout, true, message)
     }
 
     pub fn cancellation(job_id: Option<Uuid>, message: impl Into<String>) -> Self {
@@ -216,7 +211,6 @@ pub fn output_schema() -> Value {
                     {"type": "string", "enum": [
                         "process_exit",
                         "spawn_error",
-                        "timeout",
                         "cancellation",
                         "approval_denied",
                         "invalid_arguments",
@@ -265,7 +259,6 @@ mod tests {
                 stderr: "bad input\n".to_owned(),
             }),
             CommandOutcome::spawn_error("executable not found"),
-            CommandOutcome::timeout("Command exceeded its execution deadline."),
             CommandOutcome::cancellation(Some(job_id), "Command was stopped."),
             CommandOutcome::approval_denied("Approval was denied; command was not started."),
             CommandOutcome::invalid_arguments("command must contain at least one argv entry"),

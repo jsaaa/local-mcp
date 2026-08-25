@@ -30,7 +30,6 @@
           "enum": [
             "process_exit",
             "spawn_error",
-            "timeout",
             "cancellation",
             "approval_denied",
             "invalid_arguments",

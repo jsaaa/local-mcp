@@ -664,12 +664,11 @@ fn resolve_path(session_cwd: &Path, path: PathBuf) -> PathBuf {
 }
 
 fn cwd(args: &Value, session_cwd: &Path) -> Result<PathBuf> {
-    let path = args
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .map(|path| resolve_path(session_cwd, path))
-        .unwrap_or_else(|| session_cwd.to_owned());
+    let path = match args.get("cwd") {
+        None => session_cwd.to_owned(),
+        Some(Value::String(value)) => resolve_path(session_cwd, PathBuf::from(value)),
+        Some(_) => anyhow::bail!("cwd must be a string when provided"),
+    };
     std::fs::canonicalize(&path).with_context(|| format!("cannot resolve cwd {}", path.display()))
 }
 
@@ -1317,6 +1316,27 @@ mod tests {
         assert_eq!(structured(&missing)["error_kind"], "invalid_arguments");
         let empty = execute(&json!({"command": []}), &session).await.unwrap();
         assert_eq!(structured(&empty)["error_kind"], "invalid_arguments");
+
+        let marker = directory.join("must-not-run");
+        for invalid_cwd in [json!(123), Value::Null] {
+            let result = execute(
+                &json!({
+                    "command": ["sh", "-c", format!("touch {}", marker.display())],
+                    "cwd": invalid_cwd
+                }),
+                &session,
+            )
+            .await
+            .unwrap();
+            assert_eq!(structured(&result)["error_kind"], "invalid_arguments");
+            assert!(
+                structured(&result)["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cwd must be a string")
+            );
+            assert!(!marker.exists());
+        }
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

@@ -121,7 +121,7 @@ also publish the corresponding `outputSchema`. The current schema version is
 
 `status` is one of `running`, `completed`, `failed`, or `stopped`.
 `error_kind` is null for successful/running outcomes, or one of
-`process_exit`, `spawn_error`, `timeout`, `cancellation`, `approval_denied`,
+`process_exit`, `spawn_error`, `cancellation`, `approval_denied`,
 `invalid_arguments`, and `internal`. A non-zero child exit, a denied approval,
 and other expected command-lifecycle failures are ordinary MCP tool results;
 they may set MCP `isError`, but they do not become JSON-RPC transport errors or

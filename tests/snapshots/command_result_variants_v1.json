@@ -50,18 +50,6 @@
   {
     "schema_version": 1,
     "ok": false,
-    "status": "failed",
-    "error_kind": "timeout",
-    "exit_code": null,
-    "retryable": true,
-    "job_id": null,
-    "stdout": "",
-    "stderr": "",
-    "message": "Command exceeded its execution deadline."
-  },
-  {
-    "schema_version": 1,
-    "ok": false,
     "status": "stopped",
     "error_kind": "cancellation",
     "exit_code": null,
