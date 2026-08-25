@@ -215,6 +215,24 @@ pub async fn serve() -> Result<()> {
             continue;
         }
         let id = request.get("id").cloned().unwrap_or(Value::Null);
+        if !command_output::jsonrpc_id_within_budget(&id) {
+            write_message(
+                &mut stdout,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": -32600,
+                        "message": format!(
+                            "JSON-RPC request id exceeds {} serialized bytes",
+                            command_output::MAX_JSONRPC_ID_SERIALIZED_BYTES
+                        )
+                    }
+                }),
+            )
+            .await?;
+            continue;
+        }
         let response = match dispatch(&request).await {
             Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
             Err(error) => {
@@ -785,10 +803,21 @@ async fn spawn_sandboxed_command(
     let report_session_id = session.id.clone();
     let task_command = rendered_command.clone();
     let handle = tokio::spawn(async move {
-        let result = match sandbox::run(&command, &cwd, &roots, None).await {
-            Ok(output) => command_output::store_and_render(&log_session_id, job_id, output).await,
-            Err(error) => Err(error),
-        };
+        let result = async {
+            let logs = command_output::prepare_log_capture(&log_session_id, job_id).await?;
+            let output = sandbox::run_logged(
+                &command,
+                &cwd,
+                &roots,
+                None,
+                logs.stdout(),
+                logs.stderr(),
+                command_output::capture_preview_limit(),
+            )
+            .await?;
+            command_output::render_logged_output(job_id, output)
+        }
+        .await;
         report_command_finished(report_session_id, &task_command, &result).await;
         result
     });
@@ -936,15 +965,33 @@ async fn run_and_report(
     let rendered_command = render_command(&command);
     approvals::activity(&session_id, format!("Running {rendered_command}"), None).await;
     let job_id = Uuid::new_v4();
-    let output = if unrestricted {
-        sandbox::run_unrestricted(&command, &cwd, None).await
-    } else {
-        sandbox::run(&command, &cwd, roots, None).await
-    };
-    let result = match output {
-        Ok(output) => command_output::store_and_render(&session_id, job_id, output).await,
-        Err(error) => Err(error),
-    };
+    let result = async {
+        let logs = command_output::prepare_log_capture(&session_id, job_id).await?;
+        let output = if unrestricted {
+            sandbox::run_unrestricted_logged(
+                &command,
+                &cwd,
+                None,
+                logs.stdout(),
+                logs.stderr(),
+                command_output::capture_preview_limit(),
+            )
+            .await?
+        } else {
+            sandbox::run_logged(
+                &command,
+                &cwd,
+                roots,
+                None,
+                logs.stdout(),
+                logs.stderr(),
+                command_output::capture_preview_limit(),
+            )
+            .await?
+        };
+        command_output::render_logged_output(job_id, output)
+    }
+    .await;
     report_command_finished(session_id, &rendered_command, &result).await;
     text_result(result?)
 }
@@ -1213,6 +1260,17 @@ mod tests {
     fn rejects_unknown_ui_resource() {
         let error = read_resource(&json!({"uri": "ui://local-mcp/unknown.html"})).unwrap_err();
         assert!(error.to_string().contains("unknown resource"));
+    }
+
+    #[test]
+    fn jsonrpc_request_ids_are_bounded_before_tool_dispatch() {
+        assert!(command_output::jsonrpc_id_within_budget(&json!(1)));
+        assert!(command_output::jsonrpc_id_within_budget(&json!(
+            "request-1"
+        )));
+        assert!(!command_output::jsonrpc_id_within_budget(&json!(
+            "x".repeat(command_output::MAX_JSONRPC_ID_SERIALIZED_BYTES)
+        )));
     }
 
     #[test]

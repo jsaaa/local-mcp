@@ -98,13 +98,18 @@ foreground wait.
 
 ### Bounded command output and full logs
 
-Every foreground and background command receives a job ID. Complete stdout and
-stderr are stored as separate files under local-mcp's state directory, while the
-inline result contains only UTF-8-safe head/tail previews, original byte counts,
-truncation flags, and `local-mcp://jobs/<job-id>/<stream>` identifiers. Non-zero
-exit codes and bounded stderr previews remain visible even for very large output.
+Every foreground and background command receives a job ID. While the process is
+running, stdout and stderr are streamed directly to separate files under
+local-mcp's state directory. RAM retains only bounded head/tail previews, so log
+volume cannot grow the server's capture buffers without limit. The inline result
+contains those UTF-8-safe previews, original byte counts, truncation flags, and
+`local-mcp://jobs/<job-id>/<stream>` identifiers. Non-zero exit codes and bounded
+stderr previews remain visible even for very large output.
 
-The total command-result envelope is capped by `LOCAL_MCP_INLINE_OUTPUT_BYTES`.
+The complete serialized JSON-RPC success and process-error envelopes, including
+string re-escaping and a 256-byte serialized request-ID budget, are capped by
+`LOCAL_MCP_INLINE_OUTPUT_BYTES`. Oversized request IDs are rejected before tool
+dispatch, so they cannot bypass the response limit.
 The default is 16384 bytes; configured values are clamped to 2048 through
 1048576 bytes. Command and approval activity previews are bounded separately so
 a large argv or command log cannot flood the permission timeline.

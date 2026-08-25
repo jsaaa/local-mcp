@@ -1,5 +1,5 @@
 use std::cmp::min;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -15,16 +15,33 @@ pub const MIN_INLINE_OUTPUT_LIMIT: usize = 2 * 1024;
 pub const MAX_INLINE_OUTPUT_LIMIT: usize = 1024 * 1024;
 pub const DEFAULT_LOG_READ_BYTES: usize = 8 * 1024;
 pub const MAX_LOG_READ_BYTES: usize = 64 * 1024;
+pub const MAX_JSONRPC_ID_SERIALIZED_BYTES: usize = 256;
 const LOG_RETENTION_DIRECTORIES: usize = 128;
 const LOG_RETENTION_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const INLINE_LIMIT_ENV: &str = "LOCAL_MCP_INLINE_OUTPUT_BYTES";
 
 #[derive(Debug)]
 struct StreamPreview {
-    bytes: usize,
+    bytes: u64,
     truncated: bool,
     head: String,
     tail: String,
+}
+
+#[derive(Debug)]
+pub struct LogCapturePaths {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl LogCapturePaths {
+    pub fn stdout(&self) -> &Path {
+        &self.stdout
+    }
+
+    pub fn stderr(&self) -> &Path {
+        &self.stderr
+    }
 }
 
 pub fn inline_output_limit() -> usize {
@@ -35,21 +52,31 @@ pub fn inline_output_limit() -> usize {
         .clamp(MIN_INLINE_OUTPUT_LIMIT, MAX_INLINE_OUTPUT_LIMIT)
 }
 
+pub fn capture_preview_limit() -> usize {
+    inline_output_limit()
+}
+
+pub fn jsonrpc_id_within_budget(id: &Value) -> bool {
+    serde_json::to_vec(id)
+        .map(|serialized| serialized.len() <= MAX_JSONRPC_ID_SERIALIZED_BYTES)
+        .unwrap_or(false)
+}
+
 pub fn resource_uri(job_id: Uuid, stream: &str) -> String {
     format!("local-mcp://jobs/{job_id}/{stream}")
 }
 
-pub async fn store_and_render(
-    session_id: &str,
-    job_id: Uuid,
-    output: sandbox::Output,
-) -> Result<String> {
+pub async fn prepare_log_capture(session_id: &str, job_id: Uuid) -> Result<LogCapturePaths> {
     cleanup_log_storage(session_id).await?;
     let directory = execution_log_dir(session_id, job_id)?;
     tokio::fs::create_dir_all(&directory).await?;
-    tokio::fs::write(directory.join("stdout"), &output.stdout).await?;
-    tokio::fs::write(directory.join("stderr"), &output.stderr).await?;
+    Ok(LogCapturePaths {
+        stdout: directory.join("stdout"),
+        stderr: directory.join("stderr"),
+    })
+}
 
+pub fn render_logged_output(job_id: Uuid, output: sandbox::LoggedOutput) -> Result<String> {
     let value = bounded_result_value(
         job_id,
         output.status,
@@ -170,12 +197,12 @@ async fn cleanup_log_storage_with_limit(session_id: &str, max_existing: usize) -
 fn bounded_result_value(
     job_id: Uuid,
     exit_code: i32,
-    stdout: &[u8],
-    stderr: &[u8],
+    stdout: &sandbox::StreamCapture,
+    stderr: &sandbox::StreamCapture,
     requested_limit: usize,
 ) -> Value {
     let limit = requested_limit.clamp(MIN_INLINE_OUTPUT_LIMIT, MAX_INLINE_OUTPUT_LIMIT);
-    let mut preview_budget = limit.saturating_sub(1024);
+    let mut preview_budget = limit;
     loop {
         let (stdout_budget, stderr_budget) = split_preview_budget(preview_budget, stdout, stderr);
         let stdout_preview = stream_preview(stdout, stdout_budget);
@@ -196,19 +223,54 @@ fn bounded_result_value(
             "stderr_resource": resource_uri(job_id, "stderr"),
             "read_tool": "read_job_log",
         });
-        let rendered_len = serde_json::to_vec(&value)
-            .map(|bytes| bytes.len())
-            .unwrap_or(limit + 1);
-        if rendered_len <= limit || preview_budget == 0 {
+        let text = serde_json::to_string(&value).expect("command result metadata must serialize");
+        let response_bytes = max_jsonrpc_response_bytes(&text);
+        if response_bytes <= limit {
             return value;
         }
-        let excess = rendered_len - limit;
-        preview_budget = preview_budget.saturating_sub(excess.saturating_add(64));
+        if preview_budget == 0 {
+            debug_assert!(
+                response_bytes <= limit,
+                "command result metadata exceeds the minimum response limit"
+            );
+            return value;
+        }
+        preview_budget =
+            preview_budget.saturating_sub(response_bytes.saturating_sub(limit).max(64));
     }
 }
 
-fn split_preview_budget(total: usize, stdout: &[u8], stderr: &[u8]) -> (usize, usize) {
-    match (stdout.is_empty(), stderr.is_empty()) {
+fn max_jsonrpc_response_bytes(text: &str) -> usize {
+    let reserved_id = "i".repeat(MAX_JSONRPC_ID_SERIALIZED_BYTES.saturating_sub(2));
+    let success = json!({
+        "jsonrpc": "2.0",
+        "id": reserved_id,
+        "result": {"content": [{"type": "text", "text": text}]}
+    });
+    let error = json!({
+        "jsonrpc": "2.0",
+        "id": "i".repeat(MAX_JSONRPC_ID_SERIALIZED_BYTES.saturating_sub(2)),
+        "error": {"code": -32000, "message": text}
+    });
+    // write_message appends one newline byte after the serialized JSON-RPC
+    // object, so include it in the on-wire response budget as well.
+    serde_json::to_vec(&success)
+        .expect("success response must serialize")
+        .len()
+        .max(
+            serde_json::to_vec(&error)
+                .expect("error response must serialize")
+                .len(),
+        )
+        .saturating_add(1)
+}
+
+fn split_preview_budget(
+    total: usize,
+    stdout: &sandbox::StreamCapture,
+    stderr: &sandbox::StreamCapture,
+) -> (usize, usize) {
+    match (stdout.bytes == 0, stderr.bytes == 0) {
         (true, true) => (0, 0),
         (false, true) => (total, 0),
         (true, false) => (0, total),
@@ -219,32 +281,35 @@ fn split_preview_budget(total: usize, stdout: &[u8], stderr: &[u8]) -> (usize, u
     }
 }
 
-fn stream_preview(bytes: &[u8], budget: usize) -> StreamPreview {
-    if bytes.is_empty() || budget == 0 {
+fn stream_preview(stream: &sandbox::StreamCapture, budget: usize) -> StreamPreview {
+    if stream.bytes == 0 || budget == 0 {
         return StreamPreview {
-            bytes: bytes.len(),
-            truncated: !bytes.is_empty(),
+            bytes: stream.bytes,
+            truncated: stream.bytes != 0,
             head: String::new(),
             tail: String::new(),
         };
     }
-    let lossy = String::from_utf8_lossy(bytes);
-    if bytes.len() <= budget && lossy.len() <= budget {
+
+    if stream.bytes <= budget as u64 && stream.head.len() as u64 >= stream.bytes {
+        let complete = &stream.head[..stream.bytes as usize];
         return StreamPreview {
-            bytes: bytes.len(),
+            bytes: stream.bytes,
             truncated: false,
-            head: lossy.into_owned(),
+            head: String::from_utf8_lossy(complete).into_owned(),
             tail: String::new(),
         };
     }
 
     let head_budget = budget / 2 + budget % 2;
     let tail_budget = budget / 2;
+    let head = String::from_utf8_lossy(&stream.head);
+    let tail = String::from_utf8_lossy(&stream.tail);
     StreamPreview {
-        bytes: bytes.len(),
+        bytes: stream.bytes,
         truncated: true,
-        head: bounded_utf8_prefix(&lossy, head_budget),
-        tail: bounded_utf8_suffix(&lossy, tail_budget),
+        head: bounded_utf8_prefix(&head, head_budget),
+        tail: bounded_utf8_suffix(&tail, tail_budget),
     }
 }
 
@@ -278,20 +343,34 @@ fn bounded_utf8_suffix(text: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
 
+    fn capture(bytes: &[u8], limit: usize) -> sandbox::StreamCapture {
+        sandbox::StreamCapture {
+            bytes: bytes.len() as u64,
+            head: bytes[..bytes.len().min(limit)].to_vec(),
+            tail: bytes[bytes.len().saturating_sub(limit)..].to_vec(),
+        }
+    }
+
     #[test]
-    fn large_results_are_utf8_safe_and_fit_the_configured_limit() {
-        let stdout = "日本語🙂".repeat(10_000).into_bytes();
-        let stderr = b"important failure\n".repeat(2_000);
-        let value = bounded_result_value(Uuid::new_v4(), 7, &stdout, &stderr, 4096);
-        let rendered = serde_json::to_vec(&value).unwrap();
+    fn large_results_are_utf8_safe_and_fit_final_jsonrpc_envelopes() {
+        let stdout = "日本語🙂\\\"".repeat(10_000).into_bytes();
+        let stderr = b"important failure\\n\\\\quoted\\n".repeat(2_000);
+        let value = bounded_result_value(
+            Uuid::new_v4(),
+            7,
+            &capture(&stdout, 4096),
+            &capture(&stderr, 4096),
+            4096,
+        );
+        let text = serde_json::to_string(&value).unwrap();
 
         assert!(
-            rendered.len() <= 4096,
-            "result was {} bytes",
-            rendered.len()
+            max_jsonrpc_response_bytes(&text) <= 4096,
+            "final response was {} bytes",
+            max_jsonrpc_response_bytes(&text)
         );
-        assert_eq!(value["stdout_bytes"], stdout.len());
-        assert_eq!(value["stderr_bytes"], stderr.len());
+        assert_eq!(value["stdout_bytes"], stdout.len() as u64);
+        assert_eq!(value["stderr_bytes"], stderr.len() as u64);
         assert_eq!(value["exit_code"], 7);
         assert!(value["stdout_truncated"].as_bool().unwrap());
         assert!(value["stderr_truncated"].as_bool().unwrap());
@@ -303,17 +382,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn minimum_limit_bounds_both_success_and_error_jsonrpc_responses() {
+        let stdout = b"\\\"\\\\\\n".repeat(100_000);
+        let value = bounded_result_value(
+            Uuid::new_v4(),
+            1,
+            &capture(&stdout, MIN_INLINE_OUTPUT_LIMIT),
+            &capture(&[], MIN_INLINE_OUTPUT_LIMIT),
+            MIN_INLINE_OUTPUT_LIMIT,
+        );
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(max_jsonrpc_response_bytes(&text) <= MIN_INLINE_OUTPUT_LIMIT);
+    }
+
     #[tokio::test]
     async fn stored_logs_are_range_readable_and_session_scoped() {
         let session_id = format!("output-test-{}", Uuid::new_v4());
         let other_session_id = format!("output-test-{}", Uuid::new_v4());
         let job_id = Uuid::new_v4();
-        let output = sandbox::Output {
-            status: 0,
-            stdout: b"0123456789".to_vec(),
-            stderr: vec![0xff, 0x00, 0x01],
-        };
-        store_and_render(&session_id, job_id, output).await.unwrap();
+        let paths = prepare_log_capture(&session_id, job_id).await.unwrap();
+        tokio::fs::write(paths.stdout(), b"0123456789")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.stderr(), [0xff, 0x00, 0x01])
+            .await
+            .unwrap();
 
         let range = read_range(&session_id, job_id, "stdout", 3, 4)
             .await
