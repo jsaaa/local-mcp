@@ -96,6 +96,38 @@ to check for completion or `stop_job` to terminate them. Use `start_command`
 when a command should run in the background immediately without the 30-second
 foreground wait.
 
+### Bounded command output and full logs
+
+Every foreground and background command receives a job ID. Complete stdout and
+stderr are stored as separate files under local-mcp's state directory, while the
+inline result contains only UTF-8-safe head/tail previews, original byte counts,
+truncation flags, and `local-mcp://jobs/<job-id>/<stream>` identifiers. Non-zero
+exit codes and bounded stderr previews remain visible even for very large output.
+
+The total command-result envelope is capped by `LOCAL_MCP_INLINE_OUTPUT_BYTES`.
+The default is 16384 bytes; configured values are clamped to 2048 through
+1048576 bytes. Command and approval activity previews are bounded separately so
+a large argv or command log cannot flood the permission timeline.
+
+Use `read_job_log` to read the complete stored stream in bounded ranges:
+
+```json
+{
+  "session_id": "...",
+  "job_id": "...",
+  "stream": "stdout",
+  "offset": 0,
+  "length": 8192
+}
+```
+
+`length` is limited to 65536 bytes per call. Valid UTF-8 ranges are returned as
+text; arbitrary binary ranges are returned as base64. Log paths are derived from
+the owning session, so another session cannot read the same job ID. Before a new
+command log is stored, local-mcp removes entries older than seven days and keeps
+at most 128 command-log directories per session. This cleanup is best-effort and
+completed results otherwise remain available after polling.
+
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
 available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands use

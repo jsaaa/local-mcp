@@ -11,8 +11,8 @@ use tokio::process::Command;
 
 pub struct Output {
     pub status: i32,
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 fn absolute(path: &Path) -> Result<AbsolutePathBuf> {
@@ -128,8 +128,8 @@ pub async fn run(
     let output = child.wait_with_output().await?;
     Ok(Output {
         status: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: output.stdout,
+        stderr: output.stderr,
     })
 }
 
@@ -164,8 +164,8 @@ pub async fn run_unrestricted(
     let output = child.wait_with_output().await?;
     Ok(Output {
         status: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: output.stdout,
+        stderr: output.stderr,
     })
 }
 

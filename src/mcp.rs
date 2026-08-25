@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::{approvals, config, sandbox};
+use crate::{approvals, command_output, config, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const HEARTBEAT_DEFAULT_NAME: &str = "default";
@@ -313,6 +313,7 @@ fn tools() -> Value {
         {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"read_job_log","description":"Read a bounded byte range from a command's stored stdout or stderr. Use the job_id returned in foreground/background results; access is scoped to the supplied session_id.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"},"stream":{"type":"string","enum":["stdout","stderr"]},"offset":{"type":"integer","minimum":0},"length":{"type":"integer","minimum":1,"maximum":65536}},"required":["session_id","job_id","stream"],"additionalProperties":false}},
         {"name":"heartbeat_start","description":"Start or reset an in-turn heartbeat schedule for this local-mcp session. After starting it, call heartbeat_wait repeatedly. A tick is delivered only while heartbeat_wait is actively waiting; ticks that occur while the agent is busy doing work are skipped instead of queued.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"interval_seconds":{"type":"integer","minimum":1,"maximum":86400},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id","interval_seconds"],"additionalProperties":false}},
         {"name":"heartbeat_wait","description":"Wait for the next heartbeat tick in short long-poll chunks. Call this repeatedly until status is tick, then do one work cycle and call it again. If a scheduled tick passes while no heartbeat_wait call is active because the agent is still working, that tick is skipped. This does not revive a ChatGPT turn after the turn has ended.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"max_wait_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["session_id"],"additionalProperties":false}},
         {"name":"heartbeat_status","description":"Show the current in-turn heartbeat schedule, delivered tick count, skipped tick count, and time until the next tick.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
@@ -386,6 +387,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
         "start_command" => start_command(&args, &session).await,
         "poll_job" => poll_job(&args, &session).await,
         "stop_job" => stop_job(&args, &session).await,
+        "read_job_log" => read_job_log(&args, &session).await,
         "heartbeat_start" => heartbeat_start(&args, &session).await,
         "heartbeat_wait" => heartbeat_wait(&args, &session).await,
         "heartbeat_status" => heartbeat_status(&args, &session).await,
@@ -718,11 +720,11 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         tokio::fs::write(&absolute, content).await?;
         sandbox::Output {
             status: 0,
-            stdout: String::new(),
-            stderr: String::new(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
         }
     };
-    let result = render_output(output);
+    let result = render_simple_output(output);
     let (added, removed, diff) = render_diff(&previous, content);
     let title = format!(
         "Edited {} (+{added} -{removed})",
@@ -737,32 +739,34 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
 }
 
 async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, mut handle) = spawn_sandboxed_command("execute", args, session).await?;
+    let (job_id, rendered_command, mut handle) =
+        spawn_sandboxed_command("execute", args, session).await?;
 
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => text_result(joined.context("command task failed")??),
-        Err(_) => store_job(session, rendered_command, handle, "Backgrounded").await,
+        Err(_) => store_job(job_id, session, rendered_command, handle, "Backgrounded").await,
     }
 }
 
 async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, handle) =
+    let (job_id, rendered_command, handle) =
         spawn_sandboxed_command("start_command", args, session).await?;
-    store_job(session, rendered_command, handle, "Started").await
+    store_job(job_id, session, rendered_command, handle, "Started").await
 }
 
 async fn spawn_sandboxed_command(
     operation: &str,
     args: &Value,
     session: &config::Session,
-) -> Result<(String, JoinHandle<Result<String>>)> {
+) -> Result<(Uuid, String, JoinHandle<Result<String>>)> {
     let command = required_command(args)?;
     let cwd = cwd(args, &session.cwd)?;
+    let rendered_command = render_command(&command);
     #[cfg(windows)]
     if !approvals::request(
         &session.id,
         operation,
-        format!("argv: {command:?}"),
+        format!("argv preview: {rendered_command}"),
         cwd.clone(),
     )
     .await?
@@ -775,27 +779,29 @@ async fn spawn_sandboxed_command(
     if !roots.iter().any(|root| cwd.starts_with(root)) {
         roots.push(cwd.clone());
     }
-    let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
-    let session_id = session.id.clone();
+    let job_id = Uuid::new_v4();
+    let log_session_id = session.id.clone();
+    let report_session_id = session.id.clone();
     let task_command = rendered_command.clone();
     let handle = tokio::spawn(async move {
-        let result = sandbox::run(&command, &cwd, &roots, None)
-            .await
-            .and_then(render_output);
-        report_command_finished(session_id, &task_command, &result).await;
+        let result = match sandbox::run(&command, &cwd, &roots, None).await {
+            Ok(output) => command_output::store_and_render(&log_session_id, job_id, output).await,
+            Err(error) => Err(error),
+        };
+        report_command_finished(report_session_id, &task_command, &result).await;
         result
     });
-    Ok((rendered_command, handle))
+    Ok((job_id, rendered_command, handle))
 }
 
 async fn store_job(
+    job_id: Uuid,
     session: &config::Session,
     rendered_command: String,
     handle: JoinHandle<Result<String>>,
     activity: &str,
 ) -> Result<Value> {
-    let job_id = Uuid::new_v4();
     jobs().lock().unwrap().insert(
         job_id,
         Job {
@@ -855,6 +861,34 @@ async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
     text_result(json!({"status":"stopped","job_id":job_id}).to_string())
 }
 
+async fn read_job_log(args: &Value, session: &config::Session) -> Result<Value> {
+    let job_id = required_job_id(args)?;
+    let stream = args
+        .get("stream")
+        .and_then(Value::as_str)
+        .context("missing stream")?;
+    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+    let length = args
+        .get("length")
+        .and_then(Value::as_u64)
+        .unwrap_or(command_output::DEFAULT_LOG_READ_BYTES as u64);
+    anyhow::ensure!(length > 0, "length must be at least 1");
+    anyhow::ensure!(
+        length <= command_output::MAX_LOG_READ_BYTES as u64,
+        "length must be at most {}",
+        command_output::MAX_LOG_READ_BYTES
+    );
+    let result =
+        command_output::read_range(&session.id, job_id, stream, offset, length as usize).await?;
+    approvals::activity(
+        &session.id,
+        format!("Read {stream} for job {job_id}"),
+        Some(format!("└ offset {offset}, length {length}")),
+    )
+    .await;
+    text_result(serde_json::to_string_pretty(&result)?)
+}
+
 fn required_job_id(args: &Value) -> Result<Uuid> {
     let value = args
         .get("job_id")
@@ -882,7 +916,7 @@ async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Valu
     if !approvals::request(
         &session.id,
         "without_sandbox",
-        format!("argv: {command:?}"),
+        format!("argv preview: {}", render_command(&command)),
         cwd.clone(),
     )
     .await?
@@ -901,28 +935,50 @@ async fn run_and_report(
 ) -> Result<Value> {
     let rendered_command = render_command(&command);
     approvals::activity(&session_id, format!("Running {rendered_command}"), None).await;
+    let job_id = Uuid::new_v4();
     let output = if unrestricted {
         sandbox::run_unrestricted(&command, &cwd, None).await
     } else {
         sandbox::run(&command, &cwd, roots, None).await
     };
-    let result = output.and_then(render_output);
+    let result = match output {
+        Ok(output) => command_output::store_and_render(&session_id, job_id, output).await,
+        Err(error) => Err(error),
+    };
     report_command_finished(session_id, &rendered_command, &result).await;
     text_result(result?)
 }
 
 fn render_command(command: &[String]) -> String {
-    command
+    let rendered = command
         .iter()
         .map(|arg| shell_word(arg))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    bounded_text(&rendered, 512)
+}
+
+fn bounded_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let suffix_bytes = 3;
+    let mut end = 0;
+    for (index, character) in text.char_indices() {
+        let next = index + character.len_utf8();
+        if next > max_bytes.saturating_sub(suffix_bytes) {
+            break;
+        }
+        end = next;
+    }
+    format!("{}...", &text[..end])
 }
 
 async fn report_command_finished(session_id: String, command: &str, result: &Result<String>) {
     let detail = match result {
         Ok(text) => command_summary(text),
-        Err(error) => Some(format!("└ Error: {error:#}")),
+        Err(error) => command_summary(&error.to_string())
+            .or_else(|| Some(bounded_text(&format!("└ Error: {error:#}"), 2048))),
     };
     approvals::activity(&session_id, format!("Ran {command}"), detail).await;
 }
@@ -940,16 +996,39 @@ fn shell_word(value: &str) -> String {
 
 fn command_summary(text: &str) -> Option<String> {
     let value: Value = serde_json::from_str(text).ok()?;
-    let stdout = value
-        .get("stdout")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim_end();
-    let stderr = value
-        .get("stderr")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim_end();
+    let stream_summary = |name: &str| {
+        let head_key = format!("{name}_head");
+        let tail_key = format!("{name}_tail");
+        let truncated_key = format!("{name}_truncated");
+        let head = value
+            .get(head_key.as_str())
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim_end();
+        let tail = value
+            .get(tail_key.as_str())
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim_end();
+        let truncated = value
+            .get(truncated_key.as_str())
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if head.is_empty() && tail.is_empty() {
+            return String::new();
+        }
+        if truncated && !tail.is_empty() {
+            format!(
+                "{head}
+... output truncated; use read_job_log ...
+{tail}"
+            )
+        } else {
+            head.to_owned()
+        }
+    };
+    let stdout = stream_summary("stdout");
+    let stderr = stream_summary("stderr");
     let output = if stdout.is_empty() { stderr } else { stdout };
     if output.is_empty() {
         None
@@ -959,7 +1038,10 @@ fn command_summary(text: &str) -> Option<String> {
                 .lines()
                 .map(|line| format!("└ {line}"))
                 .collect::<Vec<_>>()
-                .join("\n"),
+                .join(
+                    "
+",
+                ),
         )
     }
 }
@@ -979,9 +1061,10 @@ fn render_diff(old: &str, new: &str) -> (usize, usize, String) {
     (added, removed, rendered.trim_end().to_owned())
 }
 
-fn render_output(output: sandbox::Output) -> Result<String> {
-    let text = json!({"exit_code":output.status,"stdout":output.stdout,"stderr":output.stderr})
-        .to_string();
+fn render_simple_output(output: sandbox::Output) -> Result<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = json!({"exit_code":output.status,"stdout":stdout,"stderr":stderr}).to_string();
     if output.status == 0 {
         Ok(text)
     } else {
@@ -1130,6 +1213,50 @@ mod tests {
     fn rejects_unknown_ui_resource() {
         let error = read_resource(&json!({"uri": "ui://local-mcp/unknown.html"})).unwrap_err();
         assert!(error.to_string().contains("unknown resource"));
+    }
+
+    #[test]
+    fn read_job_log_tool_declares_bounded_range_schema() {
+        let tools = tools();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "read_job_log")
+            .unwrap();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["length"]["maximum"],
+            65536
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["stream"]["enum"],
+            json!(["stdout", "stderr"])
+        );
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn command_activity_summary_uses_bounded_head_and_tail() {
+        let text = json!({
+            "stdout_head": "first line\n",
+            "stdout_tail": "last line\n",
+            "stdout_truncated": true,
+            "stderr_head": "",
+            "stderr_tail": "",
+            "stderr_truncated": false
+        })
+        .to_string();
+        let summary = command_summary(&text).unwrap();
+        assert!(summary.contains("first line"));
+        assert!(summary.contains("output truncated"));
+        assert!(summary.contains("last line"));
+    }
+
+    #[test]
+    fn rendered_activity_command_is_utf8_safe_and_bounded() {
+        let rendered = render_command(&["echo".into(), "🙂".repeat(1000)]);
+        assert!(rendered.len() <= 512);
+        assert!(rendered.ends_with("..."));
     }
 
     #[test]
