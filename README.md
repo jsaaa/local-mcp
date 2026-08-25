@@ -91,7 +91,7 @@ a string and supports pipelines, heredocs, conditionals, and
 `execute`. `without_sandbox_shell` has full host permissions and network access,
 so approval is requested before Bash starts unless the session is in yolo mode.
 Activity output names Bash and includes only a bounded preview with common
-credential-bearing lines redacted. The complete script is not dumped into the
+credential-bearing lines redacted and terminal control characters escaped. The complete script is not dumped into the
 activity timeline.
 
 The shell-program tools are intentionally unsupported on Windows because silently

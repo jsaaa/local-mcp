@@ -970,47 +970,97 @@ fn shell_activity_label(script: &str) -> String {
 }
 
 fn shell_script_preview(script: &str) -> String {
-    let mut preview = script
-        .lines()
+    let preview = script
+        .split('\n')
         .filter_map(|line| {
             let line = line.trim();
             if line.is_empty() {
                 return None;
             }
-            let lower = line.to_ascii_lowercase();
-            let sensitive = [
-                "authorization",
-                "cookie",
-                "password",
-                "passwd",
-                "secret",
-                "token",
-                "api_key",
-                "apikey",
-                "private_key",
-            ]
-            .iter()
-            .any(|marker| lower.contains(marker));
-            Some(if sensitive {
+            Some(if shell_line_is_sensitive(line) {
                 "[redacted sensitive line]".to_owned()
             } else {
-                line.to_owned()
+                escape_terminal_controls(line)
             })
         })
         .take(3)
         .collect::<Vec<_>>()
         .join(" ⏎ ");
-    if preview.is_empty() {
-        preview = "<empty>".to_owned();
-    }
-
-    let mut chars = preview.chars();
-    let bounded = chars.by_ref().take(SHELL_PREVIEW_LIMIT).collect::<String>();
-    if chars.next().is_some() {
-        format!("{bounded}…")
+    let preview = if preview.is_empty() {
+        "<empty>".to_owned()
     } else {
-        bounded
+        preview
+    };
+    bound_utf8_preview(&preview, SHELL_PREVIEW_LIMIT)
+}
+
+fn shell_line_is_sensitive(line: &str) -> bool {
+    let normalized = line
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    [
+        "authorization",
+        "bearer",
+        "cookie",
+        "credential",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "apikey",
+        "accesskey",
+        "clientsecret",
+        "privatekey",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn escape_terminal_controls(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{1b}' => escaped.push_str("\\x1b"),
+            character if terminal_unsafe_character(character) => {
+                let code = character as u32;
+                if code <= 0xff {
+                    escaped.push_str(&format!("\\x{code:02x}"));
+                } else {
+                    escaped.push_str(&format!("\\u{{{code:x}}}"));
+                }
+            }
+            character => escaped.push(character),
+        }
     }
+    escaped
+}
+
+fn terminal_unsafe_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
+}
+
+fn bound_utf8_preview(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    const ELLIPSIS: &str = "...";
+    let mut end = max_bytes.saturating_sub(ELLIPSIS.len()).min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ELLIPSIS}", &text[..end])
 }
 
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
@@ -1368,17 +1418,31 @@ mod tests {
     }
 
     #[test]
-    fn shell_activity_preview_is_bounded_and_redacts_sensitive_lines() {
+    fn shell_activity_preview_is_terminal_safe_bounded_and_redacted() {
         let script = format!(
-            "echo safe\nTOKEN={}\necho {}",
+            "echo safe\x1b[2J\rforged\x07\nX-API-Key: {}\necho {}\nfourth line",
             "x".repeat(200),
-            "y".repeat(300)
+            "日本語".repeat(300)
         );
         let preview = shell_script_preview(&script);
-        assert!(preview.contains("echo safe"));
+        assert!(preview.contains("echo safe\\x1b[2J\\rforged\\x07"));
         assert!(preview.contains("[redacted sensitive line]"));
-        assert!(preview.chars().count() <= SHELL_PREVIEW_LIMIT + 1);
+        assert!(!preview.contains('\x1b'));
+        assert!(!preview.contains('\r'));
+        assert!(!preview.contains('\x07'));
         assert!(!preview.contains(&"x".repeat(20)));
+        assert!(!preview.contains("fourth line"));
+        assert!(preview.matches(" ⏎ ").count() <= 2);
+        assert!(preview.len() <= SHELL_PREVIEW_LIMIT);
+    }
+
+    #[test]
+    fn shell_activity_preview_escapes_c1_and_bidi_controls() {
+        let preview = shell_script_preview("printf '\u{009b}31mspoof\u{202e}'");
+        assert!(preview.contains("\\x9b"));
+        assert!(preview.contains("\\u{202e}"));
+        assert!(!preview.contains('\u{009b}'));
+        assert!(!preview.contains('\u{202e}'));
     }
 
     #[cfg(unix)]
