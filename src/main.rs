@@ -6,6 +6,7 @@ mod job_journal;
 mod mcp;
 mod sandbox;
 mod tool_args;
+mod workflow;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

@@ -252,6 +252,95 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 4096,
+          "minItems": 1,
+          "prefixItems": [
+            {
+              "minLength": 1,
+              "type": "string"
+            }
+          ],
+          "type": "array"
+        },
+        "continue_on_error": {
+          "default": false,
+          "type": "boolean"
+        },
+        "depends_on": {
+          "default": [],
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "type": "string"
+          },
+          "maxItems": 128,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "expected_outputs": {
+          "default": [],
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 256,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "idempotency_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        },
+        "required_files": {
+          "default": [],
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 256,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "idempotency_key",
+        "session_id",
+        "step_id"
+      ],
+      "type": "object"
+    },
+    "name": "run_workflow_step"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
         "job_id": {
           "format": "uuid",
           "type": "string"

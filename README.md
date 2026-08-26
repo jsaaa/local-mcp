@@ -278,6 +278,105 @@ is returned as an inspectable terminal outcome. Repeating `stop_job` is
 idempotent and returns the persisted terminal result, including after an MCP
 server restart.
 
+### Fail-closed workflow steps
+
+Use `run_workflow_step` when a command must not run unless earlier work and
+required artifacts are known to be valid. It accepts argv only and, on Linux and
+macOS, runs through the same filesystem/network sandbox as `execute`. Before a
+process is spawned, local-mcp atomically reserves the idempotency key, persists
+`pending` and `running` transitions, checks every dependency, and verifies every
+`required_files` entry is a regular file. After a normal zero exit, every
+`expected_outputs` entry must exist as a regular file or the step is recorded as
+`failed`.
+
+The journal is scoped by `session_id` and stores one atomically published,
+versioned snapshot per `step_id`, including the transition history and command
+result. Reservation and terminal updates hold both a process-local mutex and an
+OS file lock, so multiple local-mcp server processes cannot reserve the same
+idempotency key concurrently. Each live server also holds a runner lease: a
+`pending` or `running` record is recovered as `failed` only after its owning
+runner lease is no longer active, rather than merely because another server
+instance observed it.
+
+Status values are `pending`, `running`, `succeeded`, `failed`, and `blocked`. A
+missing, running, blocked, or failed dependency blocks downstream execution by
+default. `continue_on_error: true` on the failed prerequisite is the explicit
+opt-out that permits its dependents to proceed. `blocked` is retryable because no
+command was spawned: each retry rechecks dependencies and required files. The
+same key may be retried with the same invocation, or a new key may replace the
+blocked attempt when the invocation or gates intentionally changed.
+
+Once a step is durably recorded as `running`, command execution belongs to an
+independent supervisor task. Cancelling the MCP call only detaches the caller;
+the supervisor still records `succeeded` or `failed`. A retry while it is active
+returns the persisted `running` record, and a later exact retry returns the
+terminal result with `reused: true` without running a second process. Reusing a
+non-blocked key for a different invocation, or a non-blocked `step_id` with
+another key, remains a deterministic `blocked` conflict.
+
+A complete edit → focused test → acceptance sequence can look like this. First,
+edit the source with `write_file`:
+
+```json
+{
+  "session_id": "SESSION",
+  "path": "src/feature.rs",
+  "content": "// reviewed implementation
+"
+}
+```
+
+Then run the focused test and publish a gate file only after it succeeds. Shell
+syntax is explicit here: `run_workflow_step` still receives an argv array, whose
+executable happens to be `bash`.
+
+```json
+{
+  "session_id": "SESSION",
+  "step_id": "focused-tests",
+  "idempotency_key": "focused-tests-source-revision-42",
+  "command": [
+    "bash",
+    "-lc",
+    "set -euo pipefail; cargo test feature::tests; mkdir -p .local-mcp-gates; : > .local-mcp-gates/focused-tests.ok"
+  ],
+  "expected_outputs": [
+    ".local-mcp-gates/focused-tests.ok"
+  ]
+}
+```
+
+Finally, make acceptance depend on both the successful step record and its gate
+artifact. If focused testing failed or the gate file is absent, the acceptance
+command is never started.
+
+```json
+{
+  "session_id": "SESSION",
+  "step_id": "acceptance",
+  "depends_on": [
+    "focused-tests"
+  ],
+  "idempotency_key": "acceptance-source-revision-42",
+  "required_files": [
+    ".local-mcp-gates/focused-tests.ok"
+  ],
+  "command": [
+    "bash",
+    "-lc",
+    "set -euo pipefail; ./scripts/acceptance.sh --json artifacts/acceptance.json"
+  ],
+  "expected_outputs": [
+    "artifacts/acceptance.json"
+  ]
+}
+```
+
+`run_workflow_step` fails closed without starting a process on Windows in this
+release, because Windows command execution does not yet provide the required
+filesystem/network sandbox. Use the ordinary approved Windows command tools when
+server-enforced workflow gates are not required.
+
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
 available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands use

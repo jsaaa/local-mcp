@@ -17,7 +17,7 @@ use crate::tool_args::*;
 use crate::{
     approvals, command_output, command_result,
     command_result::{CommandOutcome, CommandStatus},
-    config, job_journal, sandbox,
+    config, job_journal, sandbox, workflow,
 };
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -365,6 +365,7 @@ enum ToolName {
     Execute,
     ExecuteShell,
     StartCommand,
+    RunWorkflowStep,
     PollJob,
     StopJob,
     ReadJobLog,
@@ -379,7 +380,7 @@ enum ToolName {
 }
 
 impl ToolName {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 20] = [
         Self::SessionInfo,
         Self::ReadFile,
         Self::GetImage,
@@ -388,6 +389,7 @@ impl ToolName {
         Self::Execute,
         Self::ExecuteShell,
         Self::StartCommand,
+        Self::RunWorkflowStep,
         Self::PollJob,
         Self::StopJob,
         Self::ReadJobLog,
@@ -411,6 +413,7 @@ impl ToolName {
             Self::Execute => "execute",
             Self::ExecuteShell => "execute_shell",
             Self::StartCommand => "start_command",
+            Self::RunWorkflowStep => "run_workflow_step",
             Self::PollJob => "poll_job",
             Self::StopJob => "stop_job",
             Self::ReadJobLog => "read_job_log",
@@ -453,6 +456,7 @@ impl ToolName {
             Self::Execute => generated_schema::<ExecuteArgs>(),
             Self::ExecuteShell => generated_schema::<ExecuteShellArgs>(),
             Self::StartCommand => generated_schema::<StartCommandArgs>(),
+            Self::RunWorkflowStep => workflow::input_schema(),
             Self::PollJob => generated_schema::<PollJobArgs>(),
             Self::StopJob => generated_schema::<StopJobArgs>(),
             Self::ReadJobLog => generated_schema::<ReadJobLogArgs>(),
@@ -501,6 +505,11 @@ fn tools() -> Value {
     #[cfg(windows)]
     let without_sandbox_shell_description = "Shell-program execution is unsupported on Windows. Use without_sandbox with an explicit PowerShell argv command instead.";
 
+    #[cfg(not(windows))]
+    let workflow_description = "Run one sandboxed argv workflow step with fail-closed dependency, required-file, expected-output, idempotency, and persistent state gates. The command starts only after every prerequisite is satisfied.";
+    #[cfg(windows)]
+    let workflow_description = "Fail closed without starting a process: run_workflow_step is unsupported on Windows because this release cannot provide its required filesystem/network sandbox.";
+
     let values = ToolName::ALL
         .into_iter()
         .map(|tool| {
@@ -521,6 +530,7 @@ fn tools() -> Value {
                 ToolName::Execute => execute_description,
                 ToolName::ExecuteShell => execute_shell_description,
                 ToolName::StartCommand => start_command_description,
+                ToolName::RunWorkflowStep => workflow_description,
                 ToolName::PollJob => {
                     "Poll a background command returned by execute or start_command. Returns running while active, or the persisted terminal result; completed, failed, stopped, and orphaned states remain queryable after restart."
                 }
@@ -675,6 +685,11 @@ async fn call_tool(params: &Value) -> Result<Value> {
             };
             let session = config::load_session(args.session_id.as_str()).await?;
             start_command(&args, &session).await
+        }
+        ToolName::RunWorkflowStep => {
+            let args: workflow::WorkflowStepArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(&args.session_id).await?;
+            run_workflow_step(args, &session).await
         }
         ToolName::PollJob => {
             let args: PollJobArgs = match parse_command_arguments(tool, &raw_args) {
@@ -1088,6 +1103,21 @@ async fn execute(args: &ExecuteArgs, session: &config::Session) -> Result<Value>
             .await
         }
     }
+}
+
+async fn run_workflow_step(
+    args: workflow::WorkflowStepArgs,
+    session: &config::Session,
+) -> Result<Value> {
+    let step_id = args.step_id.clone();
+    let result = workflow::run(args, session).await?;
+    approvals::activity(
+        &session.id,
+        format!("Workflow step {step_id}: {}", result.status.as_str()),
+        result.error.as_ref().map(|error| format!("└ {error}")),
+    )
+    .await;
+    text_result(serde_json::to_string_pretty(&result)?)
 }
 
 async fn execute_shell(args: &ExecuteShellArgs, session: &config::Session) -> Result<Value> {
@@ -2801,6 +2831,29 @@ mod tests {
     }
 
     #[test]
+    fn workflow_tool_schema_is_fail_closed_and_bounded() {
+        let tools = tools();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "run_workflow_step")
+            .unwrap();
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["depends_on"]["maxItems"], 128);
+        assert_eq!(schema["properties"]["required_files"]["maxItems"], 256);
+        assert_eq!(schema["properties"]["expected_outputs"]["maxItems"], 256);
+        assert_eq!(schema["properties"]["command"]["minItems"], 1);
+        assert_eq!(schema["properties"]["command"]["maxItems"], 4096);
+        assert_eq!(
+            schema["properties"]["command"]["prefixItems"][0]["minLength"],
+            1
+        );
+        assert!(tool.get("outputSchema").is_none());
+    }
+
+    #[test]
     fn list_jobs_tool_has_bounded_filterable_schema() {
         let tool = tools()
             .as_array()
@@ -3108,6 +3161,12 @@ mod tests {
             ToolName::ExecuteShell | ToolName::WithoutSandboxShell => {
                 json!({"session_id": session_id, "script": "true"})
             }
+            ToolName::RunWorkflowStep => json!({
+                "session_id": session_id,
+                "step_id": "focused-tests",
+                "idempotency_key": "focused-tests-v1",
+                "command": ["true"]
+            }),
             ToolName::PollJob | ToolName::StopJob => json!({
                 "session_id": session_id,
                 "job_id": "00000000-0000-4000-8000-000000000001"
@@ -3152,6 +3211,9 @@ mod tests {
             }
             ToolName::StartCommand => {
                 let _: StartCommandArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::RunWorkflowStep => {
+                let _: workflow::WorkflowStepArgs = parse_arguments(tool, value)?;
             }
             ToolName::PollJob => {
                 let _: PollJobArgs = parse_arguments(tool, value)?;
@@ -3557,6 +3619,7 @@ mod tests {
             ToolName::HeartbeatStop,
             ToolName::ExecuteShell,
             ToolName::WithoutSandboxShell,
+            ToolName::RunWorkflowStep,
         ];
         for tool in ToolName::ALL {
             let schema = tool.input_schema();
