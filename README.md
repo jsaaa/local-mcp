@@ -107,9 +107,9 @@ reviewable. Prefer a checked-in script for substantial workflows.
 
 For work likely to exceed the 30-second foreground timeout, use `start_command`
 and poll with short `poll_job` calls. On Linux and macOS this execution is
-sandboxed; on Windows it is approved direct host execution. On Linux and macOS this execution is
-sandboxed; on Windows it is approved direct host execution. Do not start a command whose only purpose is
-to sleep before polling. After a schema error, tool error, or non-zero process
+sandboxed; on Windows it is approved direct host execution. Do not start a
+command whose only purpose is to sleep before polling. After a schema error,
+tool error, or non-zero process
 exit, inspect the failure and stop dependent stages. A stage is successful only
 when the process exits with status zero **and** every required artifact exists.
 Keep large output in files and inspect a bounded tail, and execute one checked
