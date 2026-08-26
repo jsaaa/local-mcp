@@ -21,6 +21,7 @@ use crate::{
 };
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const REGISTERED_JOB_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const HEARTBEAT_DEFAULT_NAME: &str = "default";
 const IMAGE_VIEWER_URI: &str = "ui://local-mcp/image-viewer-v1.html";
 const MCP_APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
@@ -160,6 +161,45 @@ struct Job {
 fn jobs() -> &'static Mutex<HashMap<Uuid, Job>> {
     static JOBS: OnceLock<Mutex<HashMap<Uuid, Job>>> = OnceLock::new();
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct RegisteredJobGuard {
+    job_id: Uuid,
+    armed: bool,
+}
+
+impl RegisteredJobGuard {
+    fn new(job_id: Uuid) -> Self {
+        Self {
+            job_id,
+            armed: true,
+        }
+    }
+
+    fn id(&self) -> Uuid {
+        self.job_id
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RegisteredJobGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(job) = jobs().lock().unwrap().remove(&self.job_id) {
+            job.control.request_stop();
+            job.handle.abort();
+            let outcome = CommandOutcome::cancellation(
+                Some(self.job_id),
+                "Command was cancelled before its job ID response was delivered.",
+            );
+            let _ = persist_command_outcome(&job.session_id, self.job_id, &outcome);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -330,11 +370,12 @@ enum ToolName {
     HeartbeatWait,
     HeartbeatStatus,
     HeartbeatStop,
+    StartWithoutSandbox,
     WithoutSandbox,
 }
 
 impl ToolName {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::SessionInfo,
         Self::ReadFile,
         Self::GetImage,
@@ -350,6 +391,7 @@ impl ToolName {
         Self::HeartbeatWait,
         Self::HeartbeatStatus,
         Self::HeartbeatStop,
+        Self::StartWithoutSandbox,
         Self::WithoutSandbox,
     ];
 
@@ -370,6 +412,7 @@ impl ToolName {
             Self::HeartbeatWait => "heartbeat_wait",
             Self::HeartbeatStatus => "heartbeat_status",
             Self::HeartbeatStop => "heartbeat_stop",
+            Self::StartWithoutSandbox => "start_without_sandbox",
             Self::WithoutSandbox => "without_sandbox",
         }
     }
@@ -385,6 +428,7 @@ impl ToolName {
                 | Self::StartCommand
                 | Self::PollJob
                 | Self::StopJob
+                | Self::StartWithoutSandbox
                 | Self::WithoutSandbox
         )
     }
@@ -406,6 +450,7 @@ impl ToolName {
             Self::HeartbeatWait => generated_schema::<HeartbeatWaitArgs>(),
             Self::HeartbeatStatus => generated_schema::<HeartbeatStatusArgs>(),
             Self::HeartbeatStop => generated_schema::<HeartbeatStopArgs>(),
+            Self::StartWithoutSandbox => generated_schema::<StartWithoutSandboxArgs>(),
             Self::WithoutSandbox => generated_schema::<WithoutSandboxArgs>(),
         }
     }
@@ -477,6 +522,9 @@ fn tools() -> Value {
                 }
                 ToolName::HeartbeatStop => {
                     "Stop and remove an in-turn heartbeat schedule for this local-mcp session."
+                }
+                ToolName::StartWithoutSandbox => {
+                    "After approval, start argv immediately as an unrestricted host background job and return a job_id. The process has full host permissions and network access; denial never starts a process or creates a job."
                 }
                 ToolName::WithoutSandbox => {
                     "Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode."
@@ -642,6 +690,14 @@ async fn call_tool(params: &Value) -> Result<Value> {
             let args: HeartbeatStopArgs = parse_arguments(tool, &raw_args)?;
             let session = config::load_session(args.session_id.as_str()).await?;
             heartbeat_stop(&args, &session).await
+        }
+        ToolName::StartWithoutSandbox => {
+            let args: StartWithoutSandboxArgs = match parse_command_arguments(tool, &raw_args) {
+                Ok(args) => args,
+                Err(result) => return Ok(result),
+            };
+            let session = config::load_session(args.session_id.as_str()).await?;
+            start_without_sandbox(&args, &session).await
         }
         ToolName::WithoutSandbox => {
             let args: WithoutSandboxArgs = match parse_command_arguments(tool, &raw_args) {
@@ -1344,40 +1400,231 @@ async fn read_job_log(args: &ReadJobLogArgs, session: &config::Session) -> Resul
 }
 
 async fn without_sandbox(args: &WithoutSandboxArgs, session: &config::Session) -> Result<Value> {
-    let command = args.command.as_slice().to_vec();
-    let cwd = match cwd(args.cwd.as_deref(), &session.cwd) {
-        Ok(cwd) => cwd,
-        Err(error) => {
-            return Ok(CommandOutcome::invalid_arguments(format!("{error:#}")).tool_result());
+    without_sandbox_with_timeout(
+        args.command.as_slice(),
+        args.cwd.as_deref(),
+        session,
+        FOREGROUND_TIMEOUT,
+    )
+    .await
+}
+
+async fn without_sandbox_with_timeout(
+    command: &[String],
+    requested_cwd: Option<&str>,
+    session: &config::Session,
+    foreground_timeout: Duration,
+) -> Result<Value> {
+    let (mut registration, rendered_command) =
+        match spawn_unrestricted_job("without_sandbox", command, requested_cwd, session).await {
+            Ok(job) => job,
+            Err(outcome) => return Ok(outcome.tool_result()),
+        };
+    let job_id = registration.id();
+
+    match wait_for_registered_job(job_id, session, foreground_timeout).await {
+        Ok(Some(outcome)) => {
+            registration.disarm();
+            Ok(outcome.tool_result())
         }
-    };
-    let approved = match approvals::request(
-        &session.id,
-        "without_sandbox",
-        format!("argv preview: {}", render_command(&command)),
-        cwd.clone(),
+        Ok(None) => {
+            let result =
+                running_registered_job_result(session, &rendered_command, job_id, "Backgrounded")
+                    .await;
+            registration.disarm();
+            Ok(result)
+        }
+        Err(outcome) => Ok(outcome.tool_result()),
+    }
+}
+
+async fn start_without_sandbox(
+    args: &StartWithoutSandboxArgs,
+    session: &config::Session,
+) -> Result<Value> {
+    let (mut registration, rendered_command) = match spawn_unrestricted_job(
+        "start_without_sandbox",
+        args.command.as_slice(),
+        args.cwd.as_deref(),
+        session,
     )
     .await
     {
-        Ok(approved) => approved,
-        Err(error) => {
-            return Ok(
-                CommandOutcome::internal(format!("Approval request failed: {error:#}"))
-                    .tool_result(),
-            );
-        }
+        Ok(job) => job,
+        Err(outcome) => return Ok(outcome.tool_result()),
     };
-    if !approved {
-        return Ok(CommandOutcome::approval_denied(
-            "Approval was denied; command was not started.",
-        )
-        .tool_result());
-    }
-    Ok(run_and_report(session.id.clone(), command, cwd, true, &[])
-        .await
-        .tool_result())
+    let result =
+        running_registered_job_result(session, &rendered_command, registration.id(), "Started")
+            .await;
+    registration.disarm();
+    Ok(result)
 }
 
+async fn spawn_unrestricted_job(
+    operation: &str,
+    command: &[String],
+    requested_cwd: Option<&str>,
+    session: &config::Session,
+) -> std::result::Result<(RegisteredJobGuard, String), CommandOutcome> {
+    let command = command.to_vec();
+    let cwd = cwd(requested_cwd, &session.cwd)
+        .map_err(|error| CommandOutcome::invalid_arguments(format!("{error:#}")))?;
+    let rendered_command = render_command(&command);
+    let approved = approvals::request(
+        &session.id,
+        operation,
+        format!("argv preview: {rendered_command}"),
+        cwd.clone(),
+    )
+    .await
+    .map_err(|error| CommandOutcome::internal(format!("Approval request failed: {error:#}")))?;
+    if !approved {
+        return Err(CommandOutcome::approval_denied(format!(
+            "Approval was denied for {operation}; command was not started."
+        )));
+    }
+
+    let job_id = Uuid::new_v4();
+    job_journal::create_running(
+        &session.id,
+        job_id,
+        rendered_command.clone(),
+        cwd.clone(),
+        job_journal::ExecutionMode::Unrestricted,
+    )
+    .map_err(|error| {
+        CommandOutcome::internal(format!("Could not reserve job journal state: {error:#}"))
+            .with_job_id(job_id)
+    })?;
+    approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+
+    let log_session_id = session.id.clone();
+    let report_session_id = session.id.clone();
+    let task_command = rendered_command.clone();
+    let (control, cancellation) = sandbox::command_control();
+    let task_control = control.clone();
+    let handle = tokio::spawn(async move {
+        let outcome = match command_output::prepare_log_capture(&log_session_id, job_id).await {
+            Ok(logs) => match sandbox::run_unrestricted_logged_controlled(
+                &command,
+                &cwd,
+                None,
+                cancellation,
+                None,
+                logs.stdout(),
+                logs.stderr(),
+                command_output::capture_preview_limit(),
+            )
+            .await
+            {
+                Ok(output) => command_output::outcome_from_logged_output(job_id, output),
+                Err(error) => CommandOutcome::spawn_error(format!("{error:#}")).with_job_id(job_id),
+            },
+            Err(error) => CommandOutcome::internal(format!(
+                "Could not prepare command log capture: {error:#}"
+            ))
+            .with_job_id(job_id),
+        };
+        let final_outcome = match persist_command_outcome(&report_session_id, job_id, &outcome) {
+            Ok(_) => outcome,
+            Err(error) => CommandOutcome::internal(format!(
+                "Command completed but its result could not be persisted: {error:#}"
+            ))
+            .with_job_id(job_id),
+        };
+        report_command_finished(report_session_id, &task_command, &final_outcome).await;
+        final_outcome
+    });
+
+    // There is deliberately no await between spawning and registration. Once
+    // the host process can start, cancellation of the MCP call cannot leave an
+    // untracked process outside the session-owned job registry.
+    jobs().lock().unwrap().insert(
+        job_id,
+        Job {
+            session_id: session.id.clone(),
+            command: rendered_command.clone(),
+            handle,
+            control: task_control,
+        },
+    );
+    Ok((RegisteredJobGuard::new(job_id), rendered_command))
+}
+
+async fn wait_for_registered_job(
+    job_id: Uuid,
+    session: &config::Session,
+    foreground_timeout: Duration,
+) -> std::result::Result<Option<CommandOutcome>, CommandOutcome> {
+    let wait_until_finished = async {
+        loop {
+            let finished = {
+                let all_jobs = jobs().lock().unwrap();
+                let Some(job) = all_jobs.get(&job_id) else {
+                    return Err(CommandOutcome::internal(format!(
+                        "Registered job {job_id} disappeared before completion"
+                    ))
+                    .with_job_id(job_id));
+                };
+                if job.session_id != session.id {
+                    return Err(CommandOutcome::invalid_arguments(
+                        "job does not belong to this session",
+                    )
+                    .with_job_id(job_id));
+                }
+                job.handle.is_finished()
+            };
+            if finished {
+                return Ok(());
+            }
+            tokio::time::sleep(REGISTERED_JOB_WAIT_POLL_INTERVAL).await;
+        }
+    };
+
+    match tokio::time::timeout(foreground_timeout, wait_until_finished).await {
+        Ok(result) => result?,
+        Err(_) => return Ok(None),
+    }
+
+    let job = {
+        let mut all_jobs = jobs().lock().unwrap();
+        let Some(job) = all_jobs.get(&job_id) else {
+            return Err(CommandOutcome::internal(format!(
+                "Registered job {job_id} disappeared after completion"
+            ))
+            .with_job_id(job_id));
+        };
+        if job.session_id != session.id {
+            return Err(
+                CommandOutcome::invalid_arguments("job does not belong to this session")
+                    .with_job_id(job_id),
+            );
+        }
+        all_jobs.remove(&job_id).unwrap()
+    };
+    Ok(Some(settle_joined_outcome(
+        &session.id,
+        job_id,
+        job.handle.await,
+    )))
+}
+
+async fn running_registered_job_result(
+    session: &config::Session,
+    rendered_command: &str,
+    job_id: Uuid,
+    activity: &str,
+) -> Value {
+    approvals::activity(
+        &session.id,
+        format!("{activity} {rendered_command}"),
+        Some(format!("└ job {job_id}")),
+    )
+    .await;
+    CommandOutcome::running(job_id).tool_result()
+}
+
+#[cfg(test)]
 async fn run_and_report(
     session_id: String,
     command: Vec<String>,
@@ -1677,6 +1924,79 @@ mod tests {
         assert!(error.to_string().contains("unknown resource"));
     }
 
+    #[cfg(unix)]
+    async fn start_unrestricted_approval_responder(
+        session_id: &str,
+        operation: &'static str,
+        response: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::net::UnixListener;
+
+        let path = config::socket_path(session_id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            assert!(line.contains(operation));
+            stream
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    fn unrestricted_test_session(directory: &Path) -> config::Session {
+        config::Session {
+            id: format!("unrestricted-test-{}", Uuid::new_v4()),
+            cwd: directory.to_owned(),
+            permitted_directories: vec![directory.to_owned()],
+        }
+    }
+
+    fn structured_job_id(result: &Value) -> Uuid {
+        Uuid::parse_str(result["structuredContent"]["job_id"].as_str().unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_structured_job(job_id: Uuid, session: &config::Session) -> Value {
+        let args: PollJobArgs = serde_json::from_value(json!({
+            "session_id": session.id,
+            "job_id": job_id
+        }))
+        .unwrap();
+        for _ in 0..200 {
+            let result = poll_job(&args, session).await.unwrap();
+            if result["structuredContent"]["status"] != "running" {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("job did not finish");
+    }
+
+    #[cfg(unix)]
+    async fn cleanup_unrestricted_test(session: &config::Session, directory: &Path) {
+        let _ = tokio::fs::remove_file(config::socket_path(&session.id).unwrap()).await;
+        job_journal::remove_session_for_tests(&session.id);
+        let _ = tokio::fs::remove_dir_all(
+            config::state_dir()
+                .unwrap()
+                .join("command-logs")
+                .join(&session.id),
+        )
+        .await;
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
     #[test]
     fn command_tools_publish_the_versioned_output_schema() {
         let tools = tools();
@@ -1685,6 +2005,7 @@ mod tests {
             "start_command",
             "poll_job",
             "stop_job",
+            "start_without_sandbox",
             "without_sandbox",
         ] {
             let tool = tools
@@ -1704,6 +2025,213 @@ mod tests {
                 .unwrap();
             assert!(tool.get("outputSchema").is_none());
         }
+    }
+
+    #[test]
+    fn unrestricted_background_tool_is_declared() {
+        let tools = tools();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "start_without_sandbox")
+            .unwrap();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["command"]["type"],
+            "array"
+        );
+        assert_eq!(tool["outputSchema"], command_result::output_schema());
+        assert!(
+            tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("denial never starts")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn denied_unrestricted_approval_does_not_start_or_create_a_job() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-unrestricted-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let marker = directory.join("denied-marker");
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "start_without_sandbox", "deny")
+                .await;
+        let args: StartWithoutSandboxArgs = serde_json::from_value(json!({
+            "session_id": session.id,
+            "command": ["sh", "-c", format!("printf started > {}", marker.display())]
+        }))
+        .unwrap();
+
+        let result = start_without_sandbox(&args, &session).await.unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(result["structuredContent"]["error_kind"], "approval_denied");
+        assert_eq!(result["isError"], true);
+        assert!(!marker.exists());
+        assert_eq!(
+            jobs()
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|job| job.session_id == session.id)
+                .count(),
+            0
+        );
+        let page = job_journal::list(&session.id, &HashSet::new(), None, 0, 100).unwrap();
+        assert!(page.jobs.is_empty());
+        cleanup_unrestricted_test(&session, &directory).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_foreground_command_returns_structured_result() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-unrestricted-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "without_sandbox", "allow").await;
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf complete > foreground.txt".to_owned(),
+        ];
+
+        let result = without_sandbox_with_timeout(&command, None, &session, Duration::from_secs(1))
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(result["structuredContent"]["status"], "completed");
+        assert_eq!(result["structuredContent"]["exit_code"], 0);
+        assert!(directory.join("foreground.txt").is_file());
+        cleanup_unrestricted_test(&session, &directory).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_foreground_timeout_auto_backgrounds() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-unrestricted-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "without_sandbox", "allow").await;
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "sleep 0.1; printf complete > auto.txt".to_owned(),
+        ];
+
+        let running =
+            without_sandbox_with_timeout(&command, None, &session, Duration::from_millis(5))
+                .await
+                .unwrap();
+        responder.await.unwrap();
+        assert_eq!(running["structuredContent"]["status"], "running");
+        let job_id = structured_job_id(&running);
+        let completed = wait_for_structured_job(job_id, &session).await;
+
+        assert_eq!(completed["structuredContent"]["status"], "completed");
+        assert_eq!(completed["structuredContent"]["exit_code"], 0);
+        assert!(directory.join("auto.txt").is_file());
+        cleanup_unrestricted_test(&session, &directory).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_foreground_call_terminates_registered_unrestricted_job() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-unrestricted-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let started = directory.join("cancel-started.txt");
+        let completed = directory.join("cancel-completed.txt");
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "without_sandbox", "allow").await;
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "printf started > {}; sleep 0.5; printf completed > {}",
+                started.display(),
+                completed.display()
+            ),
+        ];
+        let call_session = session.clone();
+        let call = tokio::spawn(async move {
+            without_sandbox_with_timeout(&command, None, &call_session, Duration::from_secs(5))
+                .await
+        });
+        responder.await.unwrap();
+
+        for _ in 0..100 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.exists(), "the unrestricted process never started");
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !completed.exists(),
+            "cancelling before a job_id response must terminate the command"
+        );
+        assert_eq!(
+            jobs()
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|job| job.session_id == session.id)
+                .count(),
+            0,
+            "cancelled call leaked a registered job"
+        );
+        let stopped = job_journal::list(
+            &session.id,
+            &HashSet::new(),
+            Some(job_journal::JobState::Stopped),
+            0,
+            100,
+        )
+        .unwrap();
+        assert_eq!(stopped.jobs.len(), 1);
+        cleanup_unrestricted_test(&session, &directory).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_unrestricted_background_job_can_be_polled() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-unrestricted-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "start_without_sandbox", "allow")
+                .await;
+        let args: StartWithoutSandboxArgs = serde_json::from_value(json!({
+            "session_id": session.id,
+            "command": ["sh", "-c", "sleep 0.05; printf complete > explicit.txt"]
+        }))
+        .unwrap();
+
+        let running = start_without_sandbox(&args, &session).await.unwrap();
+        responder.await.unwrap();
+        assert_eq!(running["structuredContent"]["status"], "running");
+        let job_id = structured_job_id(&running);
+        let completed = wait_for_structured_job(job_id, &session).await;
+
+        assert_eq!(completed["structuredContent"]["status"], "completed");
+        assert_eq!(completed["structuredContent"]["exit_code"], 0);
+        assert!(directory.join("explicit.txt").is_file());
+        cleanup_unrestricted_test(&session, &directory).await;
     }
 
     #[tokio::test]
@@ -2097,7 +2625,10 @@ mod tests {
             ToolName::WriteFile => {
                 json!({"session_id": session_id, "path": "output.txt", "content": "ok"})
             }
-            ToolName::Execute | ToolName::StartCommand | ToolName::WithoutSandbox => {
+            ToolName::Execute
+            | ToolName::StartCommand
+            | ToolName::StartWithoutSandbox
+            | ToolName::WithoutSandbox => {
                 json!({"session_id": session_id, "command": ["true"]})
             }
             ToolName::PollJob | ToolName::StopJob => json!({
@@ -2165,6 +2696,9 @@ mod tests {
             }
             ToolName::HeartbeatStop => {
                 let _: HeartbeatStopArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::StartWithoutSandbox => {
+                let _: StartWithoutSandboxArgs = parse_arguments(tool, value)?;
             }
             ToolName::WithoutSandbox => {
                 let _: WithoutSandboxArgs = parse_arguments(tool, value)?;

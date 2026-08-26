@@ -579,6 +579,44 @@
       ],
       "type": "object"
     },
+    "name": "start_without_sandbox"
+  },
+  {
+    "inputSchema": {
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "session_id"
+      ],
+      "type": "object"
+    },
     "name": "without_sandbox"
   }
 ]

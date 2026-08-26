@@ -249,6 +249,7 @@ pub async fn run_controlled(
     Ok(logged_output_to_output(output))
 }
 
+#[allow(dead_code)]
 pub async fn run_logged(
     command: &[String],
     cwd: &Path,
@@ -341,6 +342,7 @@ pub async fn run_unrestricted_controlled(
     Ok(logged_output_to_output(output))
 }
 
+#[allow(dead_code)]
 pub async fn run_unrestricted_logged(
     command: &[String],
     cwd: &Path,

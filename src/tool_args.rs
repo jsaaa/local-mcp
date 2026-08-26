@@ -490,6 +490,14 @@ pub struct HeartbeatStopArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct StartWithoutSandboxArgs {
+    pub session_id: SessionId,
+    pub command: CommandArgv,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct WithoutSandboxArgs {
     pub session_id: SessionId,
     pub command: CommandArgv,

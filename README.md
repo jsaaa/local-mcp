@@ -90,11 +90,25 @@ and pending approvals do not use polling timers.
 The `start` screen also receives live activity from MCP calls. It shows file and
 image reads, directory listings, file edits with unified diffs and line counts,
 and command start/completion with output, in a compact Codex-style timeline.
-`execute` returns its normal result for commands that finish within 30 seconds.
-Longer commands continue in the background and return a `job_id`; use `poll_job`
-to check for completion or `stop_job` to terminate them. Use `start_command`
-when a command should run in the background immediately without the 30-second
-foreground wait.
+`execute` returns its normal result for sandboxed commands that finish within 30
+seconds. Longer commands continue in the background and return a `job_id`; use
+`poll_job` to check for completion or `stop_job` to stop them. Use `start_command`
+when a sandboxed command should run in the background immediately.
+
+Unrestricted execution has the same lifecycle. `without_sandbox` requests
+approval before launching, returns a normal result within 30 seconds, and
+automatically returns a `job_id` if the approved process is still running.
+`start_without_sandbox` requests approval and then starts the unrestricted job in
+the background immediately. Approval is always completed before process spawn;
+immediately after spawn the process is registered as a session-owned job before
+any foreground wait begins. If the MCP call is cancelled before a `job_id`
+response is delivered, that registered job is removed, its complete process tree
+is terminated, and a cancelled terminal result is persisted. A denied request
+creates no process and no job. Both kinds of unrestricted jobs
+remain owned by the originating session and are polled or stopped with the same
+`poll_job` and `stop_job` tools. Yolo mode skips the prompt but does not change
+job behavior or session ownership. Unrestricted background jobs retain the
+service user's full filesystem and network permissions for their entire lifetime.
 
 ### Bounded command output and full logs
 
@@ -106,8 +120,9 @@ contains UTF-8-safe previews, original byte counts, truncation flags,
 `termination` metadata, and `local-mcp://jobs/<job-id>/<stream>` identifiers.
 Non-zero exits and bounded stderr previews remain visible for very large output.
 
-The complete serialized JSON-RPC success and process-error envelopes, including
-string re-escaping and a 256-byte serialized request-ID budget, are capped by
+The complete serialized JSON-RPC tool-result envelope, including both `content`
+and `structuredContent`, string re-escaping, and a 256-byte serialized request-ID
+budget, is capped by
 `LOCAL_MCP_INLINE_OUTPUT_BYTES`. Oversized request IDs are rejected before tool
 dispatch. The default is 16384 bytes; configured values are clamped to 2048
 through 1048576 bytes. Command and approval activity previews are bounded
@@ -135,7 +150,7 @@ closed rather than deleting a running command's logs.
 
 ### Persistent job journal
 
-Background command lifecycle metadata is persisted below local-mcp's state
+Command lifecycle metadata is persisted below local-mcp's state
 directory in a session-scoped journal. Each update is written to a unique
 temporary file, flushed, and atomically renamed to a versioned JSON snapshot. A
 partial temporary write is ignored and cleaned up; a corrupt latest snapshot
@@ -172,7 +187,8 @@ results and counted in `corrupt_entries`. On Windows, argv jobs are recorded as
 
 ### Structured command results
 
-`execute`, `start_command`, `poll_job`, `stop_job`, and `without_sandbox` publish a
+`execute`, `start_command`, `poll_job`, `stop_job`, `without_sandbox`, and
+`start_without_sandbox` publish a
 versioned `outputSchema` and return the same command-result contract in MCP
 `structuredContent`. The current schema version is `1`. Its core fields identify
 `running`, `completed`, `failed`, or `stopped` status; distinguish
@@ -220,11 +236,10 @@ Command result JSON includes `termination` and `termination_trigger` fields. The
 possible lifecycle results are `exited`, `stopped`, `timeout`, `cancelled`, and
 `forced_kill`; a forced result also identifies whether stop, timeout,
 cancellation, or post-completion descendant cleanup triggered the escalation.
-Normal non-zero process exits remain
-command errors, while lifecycle termination is returned as an inspectable
-terminal outcome. Repeating `stop_job` for a recently stopped in-memory job is
-idempotent and returns the cached terminal result. The cache is bounded to 256
-entries per MCP process.
+Normal non-zero process exits remain command errors, while lifecycle termination
+is returned as an inspectable terminal outcome. Repeating `stop_job` is
+idempotent and returns the persisted terminal result, including after an MCP
+server restart.
 
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
