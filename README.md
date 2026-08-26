@@ -119,6 +119,53 @@ that turn has ended. For example, an agent emulating `every 5m` should use
 `interval_seconds: 300`, wait until `status: "tick"`, do one work cycle, and then
 resume calling `heartbeat_wait`.
 
+## Reliable agent execution
+
+The server's `initialize` response publishes the same execution rules to every MCP
+client, even when no external system prompt is installed. These rules guide
+ordinary sequencing. The server separately enforces each tool's documented
+sandbox, approval, process-tree, bounded-output, persistent-journal, and workflow
+gates. Ordinary command tools do not provide a general artifact gate;
+`run_workflow_step` is the server-enforced option when dependencies and artifacts
+must gate execution.
+
+Use direct argv arrays for ordinary commands so no shell parsing is implied:
+
+```json
+{"session_id":"...","command":["cargo","test","--locked"]}
+```
+
+On Unix, use `execute_shell` for sandboxed multi-line Bash and
+`without_sandbox_shell` for approved host Bash. On Windows, those shell-program
+tools fail closed; invoke PowerShell explicitly through an argv tool instead.
+Do not put a shell program string in an argv tool's `command` field.
+
+For work likely to exceed 30 seconds, use `start_command` or
+`start_without_sandbox`, then poll with short `poll_job` calls. Do not run a
+sleeping command merely to delay the next poll. On Linux and macOS,
+`execute`/`start_command` are sandboxed with network disabled. On Windows they are
+approved direct host execution with the user's filesystem and network access.
+
+After a schema error, tool error, structured failure, or non-zero exit, inspect
+the result before running dependent work. On Linux and macOS, use
+`run_workflow_step` when dependency success, required files, expected outputs, and
+idempotency must be enforced. It is unsupported on Windows. Treat a stage as
+successful only when its structured status is `completed`, its exit code is zero,
+and every required artifact exists. Full logs are file-backed; use
+`read_job_log` for bounded ranges instead of returning unbounded output.
+
+Good sequencing:
+
+```text
+edit -> focused test completes -> verify gate/output -> acceptance -> commit
+```
+
+Unsafe sequencing:
+
+```text
+edit -> test fails -> assume artifact exists -> run destructive acceptance step
+```
+
 Each session uses its own local IPC endpoint: an explicitly permission-restricted
 Unix domain socket on Unix, or a named pipe using Windows' default security
 descriptor. Both the MCP server and the start UI block on I/O, so idle operation
@@ -127,8 +174,7 @@ and pending approvals do not use polling timers.
 The `start` screen also receives live activity from MCP calls. It shows file and
 image reads, directory listings, file edits with unified diffs and line counts,
 and command start/completion with output, in a compact Codex-style timeline.
-`execute` returns its normal result for sandboxed commands that finish within 30
-seconds. Longer commands continue in the background and return a `job_id`; use
+`execute` returns its normal result for commands that finish within 30 seconds. Longer commands continue in the background and return a `job_id`; use
 `poll_job` to check for completion or `stop_job` to stop them. Use `start_command`
 when a sandboxed command should run in the background immediately.
 

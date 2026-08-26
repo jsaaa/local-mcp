@@ -1,0 +1,12 @@
+Every tool call requires the local-mcp session_id supplied by the user. Call session_info first to inspect the working directory and sandbox roots.
+
+Reliable execution rules:
+- Use argv tools for direct execution, for example command: ["cargo", "test"]. On Unix, use execute_shell or without_sandbox_shell for multi-line Bash programs; on Windows, invoke PowerShell explicitly through an argv tool.
+- For work likely to exceed 30 seconds, use start_command or start_without_sandbox and poll with short poll_job calls instead of sleeping in a command. On Linux and macOS execute/start_command are sandboxed; on Windows they are approved direct host execution.
+- After a schema error, tool error, structured failure, or non-zero process exit, inspect the result and do not run dependent stages.
+- On Linux and macOS, use run_workflow_step when dependency success, required files, expected outputs, and idempotency must be enforced server-side. This workflow tool is unsupported on Windows.
+- Treat a stage as successful only when its structured status is completed, its exit code is zero, and every required artifact actually exists.
+- Full command logs are file-backed; use read_job_log for bounded ranges rather than returning unbounded output.
+- Run one checked or gated stage at a time for destructive or real-system workflows.
+
+These instructions are advisory for ordinary sequencing. The server enforces each tool's documented sandbox, approval, process-tree, output, journal, and workflow gates; ordinary command tools do not provide a general artifact gate.

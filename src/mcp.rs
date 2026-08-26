@@ -27,6 +27,18 @@ const REGISTERED_JOB_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const HEARTBEAT_DEFAULT_NAME: &str = "default";
 const IMAGE_VIEWER_URI: &str = "ui://local-mcp/image-viewer-v1.html";
 const MCP_APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
+const INITIALIZE_INSTRUCTIONS: &str = r#"Every tool call requires the local-mcp session_id supplied by the user. Call session_info first to inspect the working directory and sandbox roots.
+
+Reliable execution rules:
+- Use argv tools for direct execution, for example command: ["cargo", "test"]. On Unix, use execute_shell or without_sandbox_shell for multi-line Bash programs; on Windows, invoke PowerShell explicitly through an argv tool.
+- For work likely to exceed 30 seconds, use start_command or start_without_sandbox and poll with short poll_job calls instead of sleeping in a command. On Linux and macOS execute/start_command are sandboxed; on Windows they are approved direct host execution.
+- After a schema error, tool error, structured failure, or non-zero process exit, inspect the result and do not run dependent stages.
+- On Linux and macOS, use run_workflow_step when dependency success, required files, expected outputs, and idempotency must be enforced server-side. This workflow tool is unsupported on Windows.
+- Treat a stage as successful only when its structured status is completed, its exit code is zero, and every required artifact actually exists.
+- Full command logs are file-backed; use read_job_log for bounded ranges rather than returning unbounded output.
+- Run one checked or gated stage at a time for destructive or real-system workflows.
+
+These instructions are advisory for ordinary sequencing. The server enforces each tool's documented sandbox, approval, process-tree, output, journal, and workflow gates; ordinary command tools do not provide a general artifact gate."#;
 const IMAGE_VIEWER_HTML: &str = r#"<!doctype html>
 <html>
 <head>
@@ -314,7 +326,7 @@ async fn dispatch(request: &Value) -> Result<Value> {
                 "resources": {"subscribe": false, "listChanged": false}
             },
             "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
+            "instructions": INITIALIZE_INSTRUCTIONS
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
@@ -488,13 +500,13 @@ fn tools() -> Value {
     #[cfg(windows)]
     let write_file_description = "Write a UTF-8 file directly on the Windows host without a Codex sandbox. Relative paths use the session working directory.";
     #[cfg(not(windows))]
-    let execute_description = "Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required.";
+    let execute_description = r#"Execute argv without a shell in the Codex sandbox, for example command: ["cargo", "test"]. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required. Inspect any structured failure before running dependent stages."#;
     #[cfg(windows)]
-    let execute_description = "Execute argv without a shell directly on the Windows host. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
+    let execute_description = r#"Execute argv without a shell directly on the Windows host, for example command: ["cargo", "test"]. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. This has the user's filesystem and network access and requires approval unless the session is in yolo mode. Inspect any structured failure before running dependent stages."#;
     #[cfg(not(windows))]
-    let start_command_description = "Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required.";
+    let start_command_description = "Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Use this for work likely to exceed 30 seconds, then poll with short poll_job calls. Network is disabled and approval is not required.";
     #[cfg(windows)]
-    let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
+    let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. Use this for work likely to exceed 30 seconds, then poll with short poll_job calls. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
 
     #[cfg(not(windows))]
     let execute_shell_description = "Execute a multi-line Bash program in the Codex sandbox. Pass the program in script as a string; pipelines, heredocs, and set -euo pipefail are supported. Returns the normal result within 30 seconds or a job_id afterward. Network is disabled and approval is not required.";
@@ -532,7 +544,7 @@ fn tools() -> Value {
                 ToolName::StartCommand => start_command_description,
                 ToolName::RunWorkflowStep => workflow_description,
                 ToolName::PollJob => {
-                    "Poll a background command returned by execute or start_command. Returns running while active, or the persisted terminal result; completed, failed, stopped, and orphaned states remain queryable after restart."
+                    "Poll a background command returned by execute, start_command, without_sandbox, start_without_sandbox, or a shell tool. Returns running while active or the persisted terminal result. Poll in short MCP calls; do not run a sleeping command while waiting."
                 }
                 ToolName::StopJob => {
                     "Stop a background command returned by execute or start_command. The command's complete process tree receives a graceful stop followed by forced termination after a bounded grace period; repeated calls return the persisted terminal result."
@@ -556,10 +568,10 @@ fn tools() -> Value {
                     "Stop and remove an in-turn heartbeat schedule for this local-mcp session."
                 }
                 ToolName::StartWithoutSandbox => {
-                    "After approval, start argv immediately as an unrestricted host background job and return a job_id. The process has full host permissions and network access; denial never starts a process or creates a job."
+                    "After approval, start argv immediately as an unrestricted host background job and return a job_id. Use this for host work likely to exceed 30 seconds, then poll with short poll_job calls. The process has full host permissions and network access; denial never starts a process or creates a job."
                 }
                 ToolName::WithoutSandbox => {
-                    "Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode."
+                    r#"Execute argv directly on the host with full user permissions and network access, for example command: ["git", "status"]. Every call requires approval unless the session is in yolo mode. Inspect any structured failure before running dependent stages."#
                 }
                 ToolName::WithoutSandboxShell => without_sandbox_shell_description,
             };
@@ -3090,6 +3102,61 @@ mod tests {
 
         job_journal::remove_session_for_tests(&session.id);
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[test]
+    fn initialize_instructions_match_snapshot_and_released_capabilities() {
+        assert_eq!(
+            INITIALIZE_INSTRUCTIONS,
+            include_str!("../tests/snapshots/initialize_instructions.txt").trim_end()
+        );
+        for phrase in [
+            "execute_shell or without_sandbox_shell",
+            "start_command or start_without_sandbox",
+            "run_workflow_step",
+            "approved direct host execution",
+            "read_job_log",
+            "ordinary command tools do not provide a general artifact gate",
+        ] {
+            assert!(
+                INITIALIZE_INSTRUCTIONS.contains(phrase),
+                "initialize instructions are missing {phrase:?}"
+            );
+        }
+        assert!(!INITIALIZE_INSTRUCTIONS.contains("no dedicated shell-program tool"));
+    }
+
+    #[test]
+    fn execution_tool_descriptions_include_actionable_reliability_guidance() {
+        let tools = tools();
+        let description = |name: &str| {
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+        };
+
+        assert!(description("execute").contains("command: [\"cargo\", \"test\"]"));
+        assert!(description("execute").contains("dependent stages"));
+        assert!(description("start_command").contains("likely to exceed 30 seconds"));
+        assert!(description("start_without_sandbox").contains("likely to exceed 30 seconds"));
+        assert!(description("poll_job").contains("short MCP calls"));
+        assert!(description("without_sandbox").contains("command: [\"git\", \"status\"]"));
+        assert!(description("run_workflow_step").contains("fail-closed") || cfg!(windows));
+        #[cfg(not(windows))]
+        {
+            assert!(description("execute_shell").contains("multi-line Bash"));
+            assert!(description("without_sandbox_shell").contains("multi-line Bash"));
+        }
+        #[cfg(windows)]
+        {
+            assert!(description("execute_shell").contains("unsupported on Windows"));
+            assert!(description("without_sandbox_shell").contains("unsupported on Windows"));
+        }
     }
 
     #[test]
