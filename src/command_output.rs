@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use uuid::Uuid;
 
-use crate::{config, sandbox};
+use crate::{
+    command_result::{BoundedCommandOutput, CommandOutcome},
+    config, sandbox,
+};
 
 pub const DEFAULT_INLINE_OUTPUT_LIMIT: usize = 16 * 1024;
 pub const MIN_INLINE_OUTPUT_LIMIT: usize = 2 * 1024;
@@ -132,22 +135,15 @@ pub async fn prepare_log_capture(session_id: &str, job_id: Uuid) -> Result<LogCa
     })
 }
 
-pub fn render_logged_output(job_id: Uuid, output: sandbox::LoggedOutput) -> Result<String> {
-    let termination = output.termination;
-    let value = bounded_result_value(
+pub fn outcome_from_logged_output(job_id: Uuid, output: sandbox::LoggedOutput) -> CommandOutcome {
+    bounded_outcome(
         job_id,
         output.status,
-        termination,
+        output.termination,
         &output.stdout,
         &output.stderr,
         inline_output_limit(),
-    );
-    let text = serde_json::to_string(&value)?;
-    if termination == sandbox::Termination::Exited && output.status != 0 {
-        anyhow::bail!(text)
-    } else {
-        Ok(text)
-    }
+    )
 }
 
 pub async fn read_range(
@@ -333,86 +329,71 @@ async fn count_log_directories(root: &Path) -> Result<usize> {
     Ok(count)
 }
 
-fn bounded_result_value(
+fn bounded_outcome(
     job_id: Uuid,
     exit_code: i32,
     termination: sandbox::Termination,
     stdout: &sandbox::StreamCapture,
     stderr: &sandbox::StreamCapture,
     requested_limit: usize,
-) -> Value {
+) -> CommandOutcome {
     let limit = requested_limit.clamp(MIN_INLINE_OUTPUT_LIMIT, MAX_INLINE_OUTPUT_LIMIT);
     let mut preview_budget = limit;
     loop {
         let (stdout_budget, stderr_budget) = split_preview_budget(preview_budget, stdout, stderr);
         let stdout_preview = stream_preview(stdout, stdout_budget);
         let stderr_preview = stream_preview(stderr, stderr_budget);
-        let status = if termination == sandbox::Termination::Exited {
-            if exit_code == 0 {
-                "completed"
-            } else {
-                "failed"
-            }
-        } else {
-            "stopped"
-        };
-        let value = json!({
-            "job_id": job_id,
-            "status": status,
-            "exit_code": exit_code,
-            "termination": termination.as_str(),
-            "termination_trigger": termination.trigger().map(sandbox::StopTrigger::as_str),
-            "stdout_bytes": stdout_preview.bytes,
-            "stderr_bytes": stderr_preview.bytes,
-            "stdout_truncated": stdout_preview.truncated,
-            "stderr_truncated": stderr_preview.truncated,
-            "stdout_head": stdout_preview.head,
-            "stdout_tail": stdout_preview.tail,
-            "stderr_head": stderr_preview.head,
-            "stderr_tail": stderr_preview.tail,
-            "stdout_resource": resource_uri(job_id, "stdout"),
-            "stderr_resource": resource_uri(job_id, "stderr"),
-            "read_tool": "read_job_log",
+        let outcome = CommandOutcome::from_bounded_output(BoundedCommandOutput {
+            job_id,
+            exit_code,
+            termination: termination.as_str().to_owned(),
+            termination_trigger: termination
+                .trigger()
+                .map(sandbox::StopTrigger::as_str)
+                .map(str::to_owned),
+            stdout_bytes: stdout_preview.bytes,
+            stderr_bytes: stderr_preview.bytes,
+            stdout_truncated: stdout_preview.truncated,
+            stderr_truncated: stderr_preview.truncated,
+            stdout_head: stdout_preview.head,
+            stdout_tail: stdout_preview.tail,
+            stderr_head: stderr_preview.head,
+            stderr_tail: stderr_preview.tail,
+            stdout_resource: resource_uri(job_id, "stdout"),
+            stderr_resource: resource_uri(job_id, "stderr"),
+            read_tool: "read_job_log".to_owned(),
         });
-        let text = serde_json::to_string(&value).expect("command result metadata must serialize");
-        let response_bytes = max_jsonrpc_response_bytes(&text);
+        let response_bytes = max_jsonrpc_response_bytes(&outcome);
         if response_bytes <= limit {
-            return value;
+            return outcome;
         }
         if preview_budget == 0 {
             debug_assert!(
                 response_bytes <= limit,
                 "command result metadata exceeds the minimum response limit"
             );
-            return value;
+            return outcome;
         }
-        preview_budget =
-            preview_budget.saturating_sub(response_bytes.saturating_sub(limit).max(64));
+        preview_budget = if preview_budget <= 1 {
+            0
+        } else {
+            preview_budget / 2
+        };
     }
 }
 
-fn max_jsonrpc_response_bytes(text: &str) -> usize {
+fn max_jsonrpc_response_bytes(outcome: &CommandOutcome) -> usize {
     let reserved_id = "i".repeat(MAX_JSONRPC_ID_SERIALIZED_BYTES.saturating_sub(2));
-    let success = json!({
+    let response = json!({
         "jsonrpc": "2.0",
         "id": reserved_id,
-        "result": {"content": [{"type": "text", "text": text}]}
-    });
-    let error = json!({
-        "jsonrpc": "2.0",
-        "id": "i".repeat(MAX_JSONRPC_ID_SERIALIZED_BYTES.saturating_sub(2)),
-        "error": {"code": -32000, "message": text}
+        "result": outcome.tool_result()
     });
     // write_message appends one newline byte after the serialized JSON-RPC
     // object, so include it in the on-wire response budget as well.
-    serde_json::to_vec(&success)
-        .expect("success response must serialize")
+    serde_json::to_vec(&response)
+        .expect("command response must serialize")
         .len()
-        .max(
-            serde_json::to_vec(&error)
-                .expect("error response must serialize")
-                .len(),
-        )
         .saturating_add(1)
 }
 
@@ -506,7 +487,7 @@ mod tests {
     fn large_results_are_utf8_safe_and_fit_final_jsonrpc_envelopes() {
         let stdout = "日本語🙂\\\"".repeat(10_000).into_bytes();
         let stderr = b"important failure\\n\\\\quoted\\n".repeat(2_000);
-        let value = bounded_result_value(
+        let outcome = bounded_outcome(
             Uuid::new_v4(),
             7,
             sandbox::Termination::Exited,
@@ -514,30 +495,27 @@ mod tests {
             &capture(&stderr, 4096),
             4096,
         );
-        let text = serde_json::to_string(&value).unwrap();
-
         assert!(
-            max_jsonrpc_response_bytes(&text) <= 4096,
+            max_jsonrpc_response_bytes(&outcome) <= 4096,
             "final response was {} bytes",
-            max_jsonrpc_response_bytes(&text)
+            max_jsonrpc_response_bytes(&outcome)
         );
-        assert_eq!(value["stdout_bytes"], stdout.len() as u64);
-        assert_eq!(value["stderr_bytes"], stderr.len() as u64);
-        assert_eq!(value["exit_code"], 7);
-        assert!(value["stdout_truncated"].as_bool().unwrap());
-        assert!(value["stderr_truncated"].as_bool().unwrap());
-        assert!(
-            value["stderr_head"]
-                .as_str()
-                .unwrap()
-                .contains("important failure")
+        assert_eq!(outcome.stdout_bytes, stdout.len() as u64);
+        assert_eq!(outcome.stderr_bytes, stderr.len() as u64);
+        assert_eq!(outcome.exit_code, Some(7));
+        assert!(outcome.stdout_truncated);
+        assert!(outcome.stderr_truncated);
+        assert!(outcome.stderr_head.contains("important failure"));
+        assert_eq!(
+            outcome.error_kind,
+            Some(crate::command_result::CommandErrorKind::ProcessExit)
         );
     }
 
     #[test]
     fn minimum_limit_bounds_both_success_and_error_jsonrpc_responses() {
         let stdout = b"\\\"\\\\\\n".repeat(100_000);
-        let value = bounded_result_value(
+        let outcome = bounded_outcome(
             Uuid::new_v4(),
             1,
             sandbox::Termination::Exited,
@@ -545,8 +523,7 @@ mod tests {
             &capture(&[], MIN_INLINE_OUTPUT_LIMIT),
             MIN_INLINE_OUTPUT_LIMIT,
         );
-        let text = serde_json::to_string(&value).unwrap();
-        assert!(max_jsonrpc_response_bytes(&text) <= MIN_INLINE_OUTPUT_LIMIT);
+        assert!(max_jsonrpc_response_bytes(&outcome) <= MIN_INLINE_OUTPUT_LIMIT);
     }
 
     #[tokio::test]

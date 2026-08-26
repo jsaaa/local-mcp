@@ -14,7 +14,11 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::tool_args::*;
-use crate::{approvals, command_output, config, job_journal, sandbox};
+use crate::{
+    approvals, command_output, command_result,
+    command_result::{CommandOutcome, CommandStatus},
+    config, job_journal, sandbox,
+};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const HEARTBEAT_DEFAULT_NAME: &str = "default";
@@ -149,7 +153,7 @@ const IMAGE_VIEWER_HTML: &str = r#"<!doctype html>
 struct Job {
     session_id: String,
     command: String,
-    handle: JoinHandle<Result<String>>,
+    handle: JoinHandle<CommandOutcome>,
     control: sandbox::CommandControl,
 }
 
@@ -374,6 +378,17 @@ impl ToolName {
         Self::ALL.into_iter().find(|tool| tool.as_str() == value)
     }
 
+    fn has_command_output_schema(self) -> bool {
+        matches!(
+            self,
+            Self::Execute
+                | Self::StartCommand
+                | Self::PollJob
+                | Self::StopJob
+                | Self::WithoutSandbox
+        )
+    }
+
     fn input_schema(self) -> Value {
         match self {
             Self::SessionInfo => generated_schema::<SessionInfoArgs>(),
@@ -480,6 +495,9 @@ fn tools() -> Value {
                     "openai/toolInvocation/invoked": "Image ready"
                 });
             }
+            if tool.has_command_output_schema() {
+                definition["outputSchema"] = command_result::output_schema();
+            }
             definition
         })
         .collect();
@@ -489,6 +507,14 @@ fn tools() -> Value {
 fn parse_arguments<T: DeserializeOwned>(tool: ToolName, args: &Value) -> Result<T> {
     serde_json::from_value(args.clone())
         .with_context(|| format!("invalid arguments for {}", tool.as_str()))
+}
+
+fn parse_command_arguments<T: DeserializeOwned>(
+    tool: ToolName,
+    args: &Value,
+) -> std::result::Result<T, Value> {
+    parse_arguments(tool, args)
+        .map_err(|error| CommandOutcome::invalid_arguments(format!("{error:#}")).tool_result())
 }
 
 async fn call_tool(params: &Value) -> Result<Value> {
@@ -556,22 +582,34 @@ async fn call_tool(params: &Value) -> Result<Value> {
             write_file(&args, &session).await
         }
         ToolName::Execute => {
-            let args: ExecuteArgs = parse_arguments(tool, &raw_args)?;
+            let args: ExecuteArgs = match parse_command_arguments(tool, &raw_args) {
+                Ok(args) => args,
+                Err(result) => return Ok(result),
+            };
             let session = config::load_session(args.session_id.as_str()).await?;
             execute(&args, &session).await
         }
         ToolName::StartCommand => {
-            let args: StartCommandArgs = parse_arguments(tool, &raw_args)?;
+            let args: StartCommandArgs = match parse_command_arguments(tool, &raw_args) {
+                Ok(args) => args,
+                Err(result) => return Ok(result),
+            };
             let session = config::load_session(args.session_id.as_str()).await?;
             start_command(&args, &session).await
         }
         ToolName::PollJob => {
-            let args: PollJobArgs = parse_arguments(tool, &raw_args)?;
+            let args: PollJobArgs = match parse_command_arguments(tool, &raw_args) {
+                Ok(args) => args,
+                Err(result) => return Ok(result),
+            };
             let session = config::load_session(args.session_id.as_str()).await?;
             poll_job(&args, &session).await
         }
         ToolName::StopJob => {
-            let args: StopJobArgs = parse_arguments(tool, &raw_args)?;
+            let args: StopJobArgs = match parse_command_arguments(tool, &raw_args) {
+                Ok(args) => args,
+                Err(result) => return Ok(result),
+            };
             let session = config::load_session(args.session_id.as_str()).await?;
             stop_job(&args, &session).await
         }
@@ -606,7 +644,10 @@ async fn call_tool(params: &Value) -> Result<Value> {
             heartbeat_stop(&args, &session).await
         }
         ToolName::WithoutSandbox => {
-            let args: WithoutSandboxArgs = parse_arguments(tool, &raw_args)?;
+            let args: WithoutSandboxArgs = match parse_command_arguments(tool, &raw_args) {
+                Ok(args) => args,
+                Err(result) => return Ok(result),
+            };
             let session = config::load_session(args.session_id.as_str()).await?;
             without_sandbox(&args, &session).await
         }
@@ -922,18 +963,23 @@ fn argv_execution_mode() -> job_journal::ExecutionMode {
 }
 
 async fn execute(args: &ExecuteArgs, session: &config::Session) -> Result<Value> {
-    let (job_id, rendered_command, mut handle, control) = spawn_sandboxed_command(
+    let (job_id, rendered_command, mut handle, control) = match spawn_sandboxed_command(
         "execute",
         args.command.as_slice(),
         args.cwd.as_deref(),
         session,
     )
-    .await?;
+    .await
+    {
+        Ok(job) => job,
+        Err(outcome) => return Ok(outcome.tool_result()),
+    };
 
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => {
             drop(control);
-            text_result(joined.context("command task failed")??)
+            let outcome = settle_joined_outcome(&session.id, job_id, joined);
+            Ok(outcome.tool_result())
         }
         Err(_) => {
             store_job(
@@ -950,13 +996,17 @@ async fn execute(args: &ExecuteArgs, session: &config::Session) -> Result<Value>
 }
 
 async fn start_command(args: &StartCommandArgs, session: &config::Session) -> Result<Value> {
-    let (job_id, rendered_command, handle, control) = spawn_sandboxed_command(
+    let (job_id, rendered_command, handle, control) = match spawn_sandboxed_command(
         "start_command",
         args.command.as_slice(),
         args.cwd.as_deref(),
         session,
     )
-    .await?;
+    .await
+    {
+        Ok(job) => job,
+        Err(outcome) => return Ok(outcome.tool_result()),
+    };
     store_job(
         job_id,
         session,
@@ -973,25 +1023,34 @@ async fn spawn_sandboxed_command(
     command: &[String],
     requested_cwd: Option<&str>,
     session: &config::Session,
-) -> Result<(
-    Uuid,
-    String,
-    JoinHandle<Result<String>>,
-    sandbox::CommandControl,
-)> {
+) -> std::result::Result<
+    (
+        Uuid,
+        String,
+        JoinHandle<CommandOutcome>,
+        sandbox::CommandControl,
+    ),
+    CommandOutcome,
+> {
     let command = command.to_vec();
-    let cwd = cwd(requested_cwd, &session.cwd)?;
+    let cwd = cwd(requested_cwd, &session.cwd)
+        .map_err(|error| CommandOutcome::invalid_arguments(format!("{error:#}")))?;
     let rendered_command = render_command(&command);
     #[cfg(windows)]
-    if !approvals::request(
-        &session.id,
-        operation,
-        format!("argv preview: {rendered_command}"),
-        cwd.clone(),
-    )
-    .await?
     {
-        anyhow::bail!("user denied {operation}")
+        let approved = approvals::request(
+            &session.id,
+            operation,
+            format!("argv preview: {rendered_command}"),
+            cwd.clone(),
+        )
+        .await
+        .map_err(|error| CommandOutcome::internal(format!("Approval request failed: {error:#}")))?;
+        if !approved {
+            return Err(CommandOutcome::approval_denied(format!(
+                "Approval was denied for {operation}; command was not started."
+            )));
+        }
     }
     #[cfg(not(windows))]
     let _ = operation;
@@ -1006,16 +1065,19 @@ async fn spawn_sandboxed_command(
         rendered_command.clone(),
         cwd.clone(),
         argv_execution_mode(),
-    )?;
+    )
+    .map_err(|error| {
+        CommandOutcome::internal(format!("Could not reserve job journal state: {error:#}"))
+            .with_job_id(job_id)
+    })?;
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
     let log_session_id = session.id.clone();
     let report_session_id = session.id.clone();
     let task_command = rendered_command.clone();
     let (control, cancellation) = sandbox::command_control();
     let handle = tokio::spawn(async move {
-        let result = async {
-            let logs = command_output::prepare_log_capture(&log_session_id, job_id).await?;
-            let output = sandbox::run_logged_controlled(
+        let outcome = match command_output::prepare_log_capture(&log_session_id, job_id).await {
+            Ok(logs) => match sandbox::run_logged_controlled(
                 &command,
                 &cwd,
                 &roots,
@@ -1026,16 +1088,25 @@ async fn spawn_sandboxed_command(
                 logs.stderr(),
                 command_output::capture_preview_limit(),
             )
-            .await?;
-            command_output::render_logged_output(job_id, output)
-        }
-        .await;
-        let final_result = match job_journal::finish(&report_session_id, job_id, &result) {
-            Ok(_) => result,
-            Err(error) => Err(error.context("failed to persist command result")),
+            .await
+            {
+                Ok(output) => command_output::outcome_from_logged_output(job_id, output),
+                Err(error) => CommandOutcome::spawn_error(format!("{error:#}")).with_job_id(job_id),
+            },
+            Err(error) => CommandOutcome::internal(format!(
+                "Could not prepare command log capture: {error:#}"
+            ))
+            .with_job_id(job_id),
         };
-        report_command_finished(report_session_id, &task_command, &final_result).await;
-        final_result
+        let final_outcome = match persist_command_outcome(&report_session_id, job_id, &outcome) {
+            Ok(_) => outcome,
+            Err(error) => CommandOutcome::internal(format!(
+                "Command completed but its result could not be persisted: {error:#}"
+            ))
+            .with_job_id(job_id),
+        };
+        report_command_finished(report_session_id, &task_command, &final_outcome).await;
+        final_outcome
     });
     Ok((job_id, rendered_command, handle, control))
 }
@@ -1044,7 +1115,7 @@ async fn store_job(
     job_id: Uuid,
     session: &config::Session,
     rendered_command: String,
-    handle: JoinHandle<Result<String>>,
+    handle: JoinHandle<CommandOutcome>,
     control: sandbox::CommandControl,
     activity: &str,
 ) -> Result<Value> {
@@ -1063,7 +1134,7 @@ async fn store_job(
         Some(format!("└ job {job_id}")),
     )
     .await;
-    text_result(json!({"status":"running","job_id":job_id}).to_string())
+    Ok(CommandOutcome::running(job_id).tool_result())
 }
 
 async fn poll_job(args: &PollJobArgs, session: &config::Session) -> Result<Value> {
@@ -1071,87 +1142,154 @@ async fn poll_job(args: &PollJobArgs, session: &config::Session) -> Result<Value
     let in_memory = {
         let jobs = jobs().lock().unwrap();
         match jobs.get(&job_id) {
-            Some(job) => {
-                anyhow::ensure!(
-                    job.session_id == session.id,
-                    "job does not belong to this session"
-                );
-                Some(job.handle.is_finished())
+            Some(job) if job.session_id == session.id => Some(job.handle.is_finished()),
+            Some(_) => {
+                return Ok(CommandOutcome::invalid_arguments(
+                    "job does not belong to this session",
+                )
+                .with_job_id(job_id)
+                .tool_result());
             }
             None => None,
         }
     };
 
-    match in_memory {
-        None => persisted_job_result(job_journal::load(&session.id, job_id, false)?),
-        Some(false) => text_result(json!({"status":"running","job_id":job_id}).to_string()),
+    let outcome = match in_memory {
+        None => match job_journal::load(&session.id, job_id, false) {
+            Ok(record) => persisted_job_outcome(record),
+            Err(error) => {
+                CommandOutcome::invalid_arguments(format!("{error:#}")).with_job_id(job_id)
+            }
+        },
+        Some(false) => CommandOutcome::running(job_id),
         Some(true) => {
             let job = jobs().lock().unwrap().remove(&job_id).unwrap();
-            let record = settle_joined_job(&session.id, job_id, job.handle.await)?;
-            persisted_job_result(record)
+            settle_joined_outcome(&session.id, job_id, job.handle.await)
         }
-    }
+    };
+    Ok(outcome.tool_result())
 }
 
 async fn stop_job(args: &StopJobArgs, session: &config::Session) -> Result<Value> {
     let job_id = args.job_id;
     let job = {
         let mut all_jobs = jobs().lock().unwrap();
-        if let Some(job) = all_jobs.get(&job_id) {
-            anyhow::ensure!(
-                job.session_id == session.id,
-                "job does not belong to this session"
-            );
+        match all_jobs.get(&job_id) {
+            Some(job) if job.session_id == session.id => all_jobs.remove(&job_id),
+            Some(_) => {
+                return Ok(CommandOutcome::invalid_arguments(
+                    "job does not belong to this session",
+                )
+                .with_job_id(job_id)
+                .tool_result());
+            }
+            None => None,
         }
-        all_jobs.remove(&job_id)
     };
 
     let Some(job) = job else {
-        return persisted_job_result(job_journal::load(&session.id, job_id, false)?);
+        let outcome = match job_journal::load(&session.id, job_id, false) {
+            Ok(record) => persisted_job_outcome(record),
+            Err(error) => {
+                CommandOutcome::invalid_arguments(format!("{error:#}")).with_job_id(job_id)
+            }
+        };
+        return Ok(outcome.tool_result());
     };
 
     let command = job.command.clone();
-    let was_finished = job.handle.is_finished();
-    if !was_finished {
+    if !job.handle.is_finished() {
         job.control.request_stop();
     }
-    let record = settle_joined_job(&session.id, job_id, job.handle.await)?;
-    let (title, detail) = if record.state == job_journal::JobState::Stopped {
-        let termination = record
-            .result
-            .as_deref()
-            .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            .and_then(|value| value.get("termination")?.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "stopped".to_owned());
-        (
-            format!("Stopped {command}"),
-            Some(format!("└ job {job_id}; termination {termination}")),
-        )
-    } else {
-        (
-            format!("Stop skipped for finished {command}"),
-            Some(format!("└ job {job_id} already {}", record.state.as_str())),
-        )
-    };
-    approvals::activity(&session.id, title, detail).await;
-    persisted_job_result(record)
+    let outcome = settle_joined_outcome(&session.id, job_id, job.handle.await);
+    approvals::activity(
+        &session.id,
+        if outcome.status == CommandStatus::Stopped {
+            format!("Stopped {command}")
+        } else {
+            format!("Stop skipped for finished {command}")
+        },
+        Some(format!(
+            "└ job {job_id}; status {:?}; termination {}",
+            outcome.status,
+            outcome.termination.as_deref().unwrap_or("none")
+        )),
+    )
+    .await;
+    Ok(outcome.tool_result())
 }
 
-fn settle_joined_job(
+fn persist_command_outcome(
     session_id: &str,
     job_id: Uuid,
-    joined: std::result::Result<Result<String>, tokio::task::JoinError>,
+    outcome: &CommandOutcome,
 ) -> Result<job_journal::JobRecord> {
-    match joined {
-        Ok(result) => job_journal::finish(session_id, job_id, &result),
-        Err(join_error) if join_error.is_cancelled() => {
-            job_journal::mark_stopped(session_id, job_id)
+    let serialized = serde_json::to_string(outcome)?;
+    let journal_result: Result<String> = if outcome.status == CommandStatus::Failed {
+        Err(anyhow::anyhow!(serialized))
+    } else {
+        Ok(serialized)
+    };
+    job_journal::finish(session_id, job_id, &journal_result)
+}
+
+fn settle_joined_outcome(
+    session_id: &str,
+    job_id: Uuid,
+    joined: std::result::Result<CommandOutcome, tokio::task::JoinError>,
+) -> CommandOutcome {
+    let outcome = match joined {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_cancelled() => {
+            CommandOutcome::cancellation(Some(job_id), "Command task was cancelled.")
         }
-        Err(join_error) => {
-            let failure: Result<String> = Err(anyhow::anyhow!(
-                "background command task failed: {join_error}"
-            ));
-            job_journal::finish(session_id, job_id, &failure)
+        Err(error) => {
+            CommandOutcome::internal(format!("Command task failed: {error}")).with_job_id(job_id)
+        }
+    };
+    match persist_command_outcome(session_id, job_id, &outcome) {
+        Ok(_) => outcome,
+        Err(error) => {
+            CommandOutcome::internal(format!("Command outcome could not be persisted: {error:#}"))
+                .with_job_id(job_id)
+        }
+    }
+}
+
+fn persisted_job_outcome(record: job_journal::JobRecord) -> CommandOutcome {
+    let job_id = match Uuid::parse_str(&record.job_id) {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            return CommandOutcome::internal(format!("Persisted job has an invalid ID: {error}"));
+        }
+    };
+    match record.state {
+        job_journal::JobState::Running => CommandOutcome::running(job_id),
+        job_journal::JobState::Orphaned => CommandOutcome::orphaned(
+            job_id,
+            record
+                .error
+                .unwrap_or_else(|| "The command cannot be reattached.".to_owned()),
+        ),
+        job_journal::JobState::Stopped
+        | job_journal::JobState::Completed
+        | job_journal::JobState::Failed => {
+            let payload = record.result.or(record.error);
+            match payload {
+                Some(payload) => {
+                    serde_json::from_str::<CommandOutcome>(&payload).unwrap_or_else(|error| {
+                        CommandOutcome::internal(format!(
+                            "Persisted command outcome is unavailable or corrupt: {error}"
+                        ))
+                        .with_job_id(job_id)
+                    })
+                }
+                None if record.state == job_journal::JobState::Stopped => {
+                    CommandOutcome::cancellation(Some(job_id), "Command was stopped.")
+                }
+                None => CommandOutcome::internal("Persisted job has no result payload")
+                    .with_job_id(job_id),
+            }
         }
     }
 }
@@ -1187,37 +1325,6 @@ async fn list_jobs(args: &ListJobsArgs, session: &config::Session) -> Result<Val
     text_result(serde_json::to_string_pretty(&page)?)
 }
 
-fn persisted_job_result(record: job_journal::JobRecord) -> Result<Value> {
-    let job_id = record.job_id.clone();
-    match record.state {
-        job_journal::JobState::Completed => text_result(
-            record
-                .result
-                .context("completed job has no persisted result")?,
-        ),
-        job_journal::JobState::Stopped if record.result.is_some() => {
-            text_result(record.result.unwrap())
-        }
-        job_journal::JobState::Failed => {
-            anyhow::bail!(
-                record
-                    .error
-                    .unwrap_or_else(|| "persisted job failed".to_owned())
-            )
-        }
-        state => text_result(
-            json!({
-                "status": state.as_str(),
-                "job_id": job_id,
-                "exit_code": record.exit_code,
-                "error": record.error,
-                "reattachable": record.reattachable,
-            })
-            .to_string(),
-        ),
-    }
-}
-
 async fn read_job_log(args: &ReadJobLogArgs, session: &config::Session) -> Result<Value> {
     let job_id = args.job_id;
     let stream = args.stream.as_str();
@@ -1238,18 +1345,37 @@ async fn read_job_log(args: &ReadJobLogArgs, session: &config::Session) -> Resul
 
 async fn without_sandbox(args: &WithoutSandboxArgs, session: &config::Session) -> Result<Value> {
     let command = args.command.as_slice().to_vec();
-    let cwd = cwd(args.cwd.as_deref(), &session.cwd)?;
-    if !approvals::request(
+    let cwd = match cwd(args.cwd.as_deref(), &session.cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return Ok(CommandOutcome::invalid_arguments(format!("{error:#}")).tool_result());
+        }
+    };
+    let approved = match approvals::request(
         &session.id,
         "without_sandbox",
         format!("argv preview: {}", render_command(&command)),
         cwd.clone(),
     )
-    .await?
+    .await
     {
-        anyhow::bail!("user denied without_sandbox")
+        Ok(approved) => approved,
+        Err(error) => {
+            return Ok(
+                CommandOutcome::internal(format!("Approval request failed: {error:#}"))
+                    .tool_result(),
+            );
+        }
+    };
+    if !approved {
+        return Ok(CommandOutcome::approval_denied(
+            "Approval was denied; command was not started.",
+        )
+        .tool_result());
     }
-    run_and_report(session.id.clone(), command, cwd, true, &[]).await
+    Ok(run_and_report(session.id.clone(), command, cwd, true, &[])
+        .await
+        .tool_result())
 }
 
 async fn run_and_report(
@@ -1258,39 +1384,68 @@ async fn run_and_report(
     cwd: PathBuf,
     unrestricted: bool,
     roots: &[PathBuf],
-) -> Result<Value> {
+) -> CommandOutcome {
     let rendered_command = render_command(&command);
-    approvals::activity(&session_id, format!("Running {rendered_command}"), None).await;
     let job_id = Uuid::new_v4();
-    let result = async {
-        let logs = command_output::prepare_log_capture(&session_id, job_id).await?;
-        let output = if unrestricted {
-            sandbox::run_unrestricted_logged(
-                &command,
-                &cwd,
-                None,
-                logs.stdout(),
-                logs.stderr(),
-                command_output::capture_preview_limit(),
-            )
-            .await?
-        } else {
-            sandbox::run_logged(
-                &command,
-                &cwd,
-                roots,
-                None,
-                logs.stdout(),
-                logs.stderr(),
-                command_output::capture_preview_limit(),
-            )
-            .await?
-        };
-        command_output::render_logged_output(job_id, output)
+    let execution_mode = if unrestricted {
+        job_journal::ExecutionMode::Unrestricted
+    } else {
+        job_journal::ExecutionMode::Sandboxed
+    };
+    if let Err(error) = job_journal::create_running(
+        &session_id,
+        job_id,
+        rendered_command.clone(),
+        cwd.clone(),
+        execution_mode,
+    ) {
+        return CommandOutcome::internal(format!("Could not reserve job journal state: {error:#}"))
+            .with_job_id(job_id);
     }
-    .await;
-    report_command_finished(session_id, &rendered_command, &result).await;
-    text_result(result?)
+    approvals::activity(&session_id, format!("Running {rendered_command}"), None).await;
+    let outcome = match command_output::prepare_log_capture(&session_id, job_id).await {
+        Ok(logs) => {
+            let output = if unrestricted {
+                sandbox::run_unrestricted_logged(
+                    &command,
+                    &cwd,
+                    None,
+                    logs.stdout(),
+                    logs.stderr(),
+                    command_output::capture_preview_limit(),
+                )
+                .await
+            } else {
+                sandbox::run_logged(
+                    &command,
+                    &cwd,
+                    roots,
+                    None,
+                    logs.stdout(),
+                    logs.stderr(),
+                    command_output::capture_preview_limit(),
+                )
+                .await
+            };
+            match output {
+                Ok(output) => command_output::outcome_from_logged_output(job_id, output),
+                Err(error) => CommandOutcome::spawn_error(format!("{error:#}")).with_job_id(job_id),
+            }
+        }
+        Err(error) => {
+            CommandOutcome::internal(format!("Could not prepare command log capture: {error:#}"))
+                .with_job_id(job_id)
+        }
+    };
+    let outcome = match persist_command_outcome(&session_id, job_id, &outcome) {
+        Ok(_) => outcome,
+        Err(error) => CommandOutcome::internal(format!(
+            "Command completed but its result could not be persisted: {error:#}"
+        ))
+        .with_job_id(job_id),
+    };
+    report_command_finished(session_id, &rendered_command, &outcome).await;
+    outcome
 }
 
 fn render_command(command: &[String]) -> String {
@@ -1314,13 +1469,13 @@ fn bounded_text(text: &str, max_bytes: usize) -> String {
     format!("{}{SUFFIX}", &text[..end])
 }
 
-async fn report_command_finished(session_id: String, command: &str, result: &Result<String>) {
-    let detail = match result {
-        Ok(text) => command_summary(text),
-        Err(error) => command_summary(&error.to_string())
-            .or_else(|| Some(bounded_text(&format!("└ Error: {error:#}"), 2048))),
-    };
-    approvals::activity(&session_id, format!("Ran {command}"), detail).await;
+async fn report_command_finished(session_id: String, command: &str, outcome: &CommandOutcome) {
+    approvals::activity(
+        &session_id,
+        format!("Ran {command}"),
+        outcome.activity_summary(2048),
+    )
+    .await;
 }
 
 fn shell_word(value: &str) -> String {
@@ -1331,73 +1486,6 @@ fn shell_word(value: &str) -> String {
         value.to_owned()
     } else {
         format!("{:?}", value)
-    }
-}
-
-fn command_summary(text: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(text).ok()?;
-    let has_bounded_streams = ["stdout_head", "stdout_tail", "stderr_head", "stderr_tail"]
-        .iter()
-        .any(|key| value.get(*key).is_some());
-
-    let output = if has_bounded_streams {
-        let stream_summary = |name: &str| {
-            let head_key = format!("{name}_head");
-            let tail_key = format!("{name}_tail");
-            let truncated_key = format!("{name}_truncated");
-            let head = value
-                .get(head_key.as_str())
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim_end();
-            let tail = value
-                .get(tail_key.as_str())
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim_end();
-            let truncated = value
-                .get(truncated_key.as_str())
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if head.is_empty() && tail.is_empty() {
-                String::new()
-            } else if truncated && !tail.is_empty() {
-                format!("{head}\n... output truncated; use read_job_log ...\n{tail}")
-            } else {
-                head.to_owned()
-            }
-        };
-        let stdout = stream_summary("stdout");
-        let stderr = stream_summary("stderr");
-        if stdout.is_empty() { stderr } else { stdout }
-    } else {
-        let stdout = value
-            .get("stdout")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim_end();
-        let stderr = value
-            .get("stderr")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim_end();
-        if stdout.is_empty() {
-            stderr.to_owned()
-        } else {
-            stdout.to_owned()
-        }
-    };
-
-    if output.is_empty() {
-        None
-    } else {
-        Some(
-            output
-                .lines()
-                .map(|line| format!("└ {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
     }
 }
 
@@ -1590,6 +1678,96 @@ mod tests {
     }
 
     #[test]
+    fn command_tools_publish_the_versioned_output_schema() {
+        let tools = tools();
+        for name in [
+            "execute",
+            "start_command",
+            "poll_job",
+            "stop_job",
+            "without_sandbox",
+        ] {
+            let tool = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert_eq!(tool["outputSchema"], command_result::output_schema());
+        }
+        for name in ["read_file", "read_job_log", "list_jobs"] {
+            let tool = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert!(tool.get("outputSchema").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_command_arguments_are_structured_tool_outcomes() {
+        for arguments in [
+            json!({"session_id": "schema-contract", "command": "true"}),
+            json!({"session_id": "schema-contract", "command": ["true"], "cwd": 1}),
+        ] {
+            let result = call_tool(&json!({
+                "name": "execute",
+                "arguments": arguments
+            }))
+            .await
+            .unwrap();
+            assert_eq!(
+                result["structuredContent"]["error_kind"],
+                "invalid_arguments"
+            );
+            assert_eq!(result["isError"], true);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_process_exit_is_a_structured_result_not_a_transport_error() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-structured-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session_id = format!("structured-result-{}", Uuid::new_v4());
+        let outcome = run_and_report(
+            session_id.clone(),
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf output; printf failure >&2; exit 2".to_owned(),
+            ],
+            directory.clone(),
+            true,
+            &[],
+        )
+        .await;
+        let result = outcome.tool_result();
+        assert_eq!(result["structuredContent"]["error_kind"], "process_exit");
+        assert_eq!(result["structuredContent"]["exit_code"], 2);
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("failure")
+        );
+
+        job_journal::remove_session_for_tests(&session_id);
+        let _ = tokio::fs::remove_dir_all(
+            config::state_dir()
+                .unwrap()
+                .join("command-logs")
+                .join(&session_id),
+        )
+        .await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[test]
     fn jsonrpc_request_ids_are_bounded_before_tool_dispatch() {
         assert!(command_output::jsonrpc_id_within_budget(&json!(1)));
         assert!(command_output::jsonrpc_id_within_budget(&json!(
@@ -1648,16 +1826,24 @@ mod tests {
 
     #[test]
     fn command_activity_summary_uses_bounded_head_and_tail() {
-        let text = json!({
-            "stdout_head": "first line\n",
-            "stdout_tail": "last line\n",
-            "stdout_truncated": true,
-            "stderr_head": "",
-            "stderr_tail": "",
-            "stderr_truncated": false
-        })
-        .to_string();
-        let summary = command_summary(&text).unwrap();
+        let outcome = CommandOutcome::from_bounded_output(command_result::BoundedCommandOutput {
+            job_id: Uuid::new_v4(),
+            exit_code: 0,
+            termination: "exited".to_owned(),
+            termination_trigger: None,
+            stdout_bytes: 20,
+            stderr_bytes: 0,
+            stdout_truncated: true,
+            stderr_truncated: false,
+            stdout_head: "first line\n".to_owned(),
+            stdout_tail: "last line\n".to_owned(),
+            stderr_head: String::new(),
+            stderr_tail: String::new(),
+            stdout_resource: "local-mcp://jobs/test/stdout".to_owned(),
+            stderr_resource: "local-mcp://jobs/test/stderr".to_owned(),
+            read_tool: "read_job_log".to_owned(),
+        });
+        let summary = outcome.activity_summary(2048).unwrap();
         assert!(summary.contains("first line"));
         assert!(summary.contains("output truncated"));
         assert!(summary.contains("last line"));
@@ -1680,11 +1866,13 @@ mod tests {
             cwd: directory.clone(),
             permitted_directories: vec![directory.clone()],
         };
+        let job_id = Uuid::new_v4();
         let command = vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()];
         let (control, cancellation) = sandbox::command_control();
         let task_directory = directory.clone();
+        let task_job_id = job_id;
         let handle = tokio::spawn(async move {
-            sandbox::run_unrestricted_controlled(
+            match sandbox::run_unrestricted_controlled(
                 &command,
                 &task_directory,
                 None,
@@ -1692,9 +1880,35 @@ mod tests {
                 None,
             )
             .await
-            .and_then(render_output)
+            {
+                Ok(output) => {
+                    CommandOutcome::from_bounded_output(command_result::BoundedCommandOutput {
+                        job_id: task_job_id,
+                        exit_code: output.status,
+                        termination: output.termination.as_str().to_owned(),
+                        termination_trigger: output
+                            .termination
+                            .trigger()
+                            .map(sandbox::StopTrigger::as_str)
+                            .map(str::to_owned),
+                        stdout_bytes: output.stdout.len() as u64,
+                        stderr_bytes: output.stderr.len() as u64,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        stdout_head: output.stdout,
+                        stdout_tail: String::new(),
+                        stderr_head: output.stderr,
+                        stderr_tail: String::new(),
+                        stdout_resource: command_output::resource_uri(task_job_id, "stdout"),
+                        stderr_resource: command_output::resource_uri(task_job_id, "stderr"),
+                        read_tool: "read_job_log".to_owned(),
+                    })
+                }
+                Err(error) => {
+                    CommandOutcome::spawn_error(format!("{error:#}")).with_job_id(task_job_id)
+                }
+            }
         });
-        let job_id = Uuid::new_v4();
         job_journal::create_running(
             &session.id,
             job_id,
@@ -1721,9 +1935,9 @@ mod tests {
         let first = stop_job(&args, &session).await.unwrap();
         let second = stop_job(&args, &session).await.unwrap();
         assert_eq!(first, second);
-        let text = first["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("\"termination\":\"stopped\""));
-        assert!(text.contains("\"termination_trigger\":\"stop\""));
+        assert_eq!(first["structuredContent"]["termination"], "stopped");
+        assert_eq!(first["structuredContent"]["termination_trigger"], "stop");
+        assert_eq!(first["structuredContent"]["status"], "stopped");
 
         job_journal::remove_session_for_tests(&session.id);
         tokio::fs::remove_dir_all(directory).await.unwrap();
@@ -1748,21 +1962,24 @@ mod tests {
             argv_execution_mode(),
         )
         .unwrap();
-        let completed = Ok(json!({
-            "job_id": job_id,
-            "status": "completed",
-            "exit_code": 0,
-            "termination": "exited",
-            "termination_trigger": null,
-            "stdout_head": "persisted marker",
-            "stdout_tail": "",
-            "stdout_truncated": false,
-            "stderr_head": "",
-            "stderr_tail": "",
-            "stderr_truncated": false
-        })
-        .to_string());
-        job_journal::finish(&session.id, job_id, &completed).unwrap();
+        let completed = CommandOutcome::from_bounded_output(command_result::BoundedCommandOutput {
+            job_id,
+            exit_code: 0,
+            termination: "exited".to_owned(),
+            termination_trigger: None,
+            stdout_bytes: 16,
+            stderr_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            stdout_head: "persisted marker".to_owned(),
+            stdout_tail: String::new(),
+            stderr_head: String::new(),
+            stderr_tail: String::new(),
+            stdout_resource: command_output::resource_uri(job_id, "stdout"),
+            stderr_resource: command_output::resource_uri(job_id, "stderr"),
+            read_tool: "read_job_log".to_owned(),
+        });
+        persist_command_outcome(&session.id, job_id, &completed).unwrap();
 
         let args: PollJobArgs = serde_json::from_value(json!({
             "session_id": session.id,
@@ -1807,9 +2024,14 @@ mod tests {
         }))
         .unwrap();
         let result = poll_job(&args, &session).await.unwrap();
-        let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("\"status\":\"orphaned\""));
-        assert!(text.contains("cannot be reattached"));
+        assert_eq!(result["structuredContent"]["status"], "stopped");
+        assert_eq!(result["structuredContent"]["termination"], "orphaned");
+        assert!(
+            result["structuredContent"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be reattached")
+        );
 
         job_journal::remove_session_for_tests(&session.id);
         tokio::fs::remove_dir_all(directory).await.unwrap();

@@ -170,6 +170,33 @@ journal snapshot is capped at 128 KiB. Corrupt entries are omitted from list
 results and counted in `corrupt_entries`. On Windows, argv jobs are recorded as
 `unrestricted` because they execute directly on the host after approval.
 
+### Structured command results
+
+`execute`, `start_command`, `poll_job`, `stop_job`, and `without_sandbox` publish a
+versioned `outputSchema` and return the same command-result contract in MCP
+`structuredContent`. The current schema version is `1`. Its core fields identify
+`running`, `completed`, `failed`, or `stopped` status; distinguish
+`process_exit`, `spawn_error`, `cancellation`, `approval_denied`,
+`invalid_arguments`, and `internal` failures; and carry the exit code,
+retryability, and job ID. The same object also contains process-tree termination
+metadata, bounded stdout/stderr head and tail previews, original byte counts,
+truncation flags, and full-log resource identifiers.
+
+A non-zero child exit is an expected tool outcome with `isError: true`, not a
+JSON-RPC transport failure or a JSON string nested inside an error message.
+Argument validation and approval denial are likewise returned as typed tool
+outcomes when they belong to a command lifecycle. Protocol framing failures,
+unknown tool names, missing sessions, and faults outside that lifecycle may still
+use MCP/JSON-RPC errors.
+
+The `content` array remains present with a concise human-readable fallback, so
+clients that ignore `structuredContent` continue to display useful output.
+Consumers should branch on `schema_version` before relying on fields. Additive,
+backward-compatible clarifications may retain the current version; removing
+fields, changing their types or meanings, or changing enum semantics requires a
+new version and output schema. The inline-output budget described above applies
+to the complete result, including both the fallback and `structuredContent`.
+
 ### Process-tree lifecycle
 
 Every command is launched with an owned process-tree lifecycle. On Unix,

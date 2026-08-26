@@ -30,16 +30,6 @@ pub enum JobState {
 }
 
 impl JobState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Stopped => "stopped",
-            Self::Orphaned => "orphaned",
-        }
-    }
-
     fn terminal(self) -> bool {
         self != Self::Running
     }
@@ -195,6 +185,7 @@ pub fn finish(session_id: &str, job_id: Uuid, result: &Result<String>) -> Result
     Ok(record)
 }
 
+#[cfg(test)]
 pub fn mark_stopped(session_id: &str, job_id: Uuid) -> Result<JobRecord> {
     let _guard = journal_lock().lock().unwrap();
     let mut record = load_latest_locked(session_id, job_id)?;

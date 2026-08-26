@@ -1,5 +1,6 @@
 mod approvals;
 mod command_output;
+mod command_result;
 mod config;
 mod job_journal;
 mod mcp;

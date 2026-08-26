@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "error_kind": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "enum": [
+            "process_exit",
+            "spawn_error",
+            "cancellation",
+            "approval_denied",
+            "invalid_arguments",
+            "internal"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "exit_code": {
+      "oneOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "job_id": {
+      "oneOf": [
+        {
+          "format": "uuid",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "message": {
+      "type": "string"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "read_tool": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "status": {
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "stopped"
+      ],
+      "type": "string"
+    },
+    "stderr_bytes": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "stderr_head": {
+      "type": "string"
+    },
+    "stderr_resource": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "stderr_tail": {
+      "type": "string"
+    },
+    "stderr_truncated": {
+      "type": "boolean"
+    },
+    "stdout_bytes": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "stdout_head": {
+      "type": "string"
+    },
+    "stdout_resource": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "stdout_tail": {
+      "type": "string"
+    },
+    "stdout_truncated": {
+      "type": "boolean"
+    },
+    "termination": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "enum": [
+            "exited",
+            "stopped",
+            "timeout",
+            "cancelled",
+            "forced_kill",
+            "orphaned"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "termination_trigger": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "enum": [
+            "stop",
+            "timeout",
+            "cancellation",
+            "completion"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "ok",
+    "status",
+    "error_kind",
+    "exit_code",
+    "retryable",
+    "job_id",
+    "message",
+    "termination",
+    "termination_trigger",
+    "stdout_bytes",
+    "stderr_bytes",
+    "stdout_truncated",
+    "stderr_truncated",
+    "stdout_head",
+    "stdout_tail",
+    "stderr_head",
+    "stderr_tail",
+    "stdout_resource",
+    "stderr_resource",
+    "read_tool"
+  ],
+  "title": "LocalMcpCommandResultV1",
+  "type": "object"
+}
