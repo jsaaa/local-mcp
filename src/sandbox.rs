@@ -231,9 +231,6 @@ async fn run_process(
         .stderr
         .take()
         .context("command stderr was not piped")?;
-    let stdout_task = tokio::spawn(pump_stream(stdout, stdout_file, preview_limit));
-    let stderr_task = tokio::spawn(pump_stream(stderr, stderr_file, preview_limit));
-
     if let Some(bytes) = stdin
         && let Some(mut child_stdin) = child.stdin.take()
     {
@@ -241,10 +238,19 @@ async fn run_process(
         child_stdin.shutdown().await?;
     }
 
-    let status_result = child.wait().await;
-    let stdout = stdout_task.await.context("stdout capture task failed")??;
-    let stderr = stderr_task.await.context("stderr capture task failed")??;
-    let status = status_result?;
+    let (status, stdout, stderr) = tokio::try_join!(
+        async { child.wait().await.context("failed to wait for command") },
+        async {
+            pump_stream(stdout, stdout_file, preview_limit)
+                .await
+                .context("failed to capture command stdout")
+        },
+        async {
+            pump_stream(stderr, stderr_file, preview_limit)
+                .await
+                .context("failed to capture command stderr")
+        },
+    )?;
     Ok(LoggedOutput {
         status: status.code().unwrap_or(-1),
         stdout,

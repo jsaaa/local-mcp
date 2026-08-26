@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -18,6 +19,8 @@ pub const MAX_LOG_READ_BYTES: usize = 64 * 1024;
 pub const MAX_JSONRPC_ID_SERIALIZED_BYTES: usize = 256;
 const LOG_RETENTION_DIRECTORIES: usize = 128;
 const LOG_RETENTION_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const ACTIVE_LEASE_FILE: &str = ".active.lock";
+const RETENTION_LOCK_FILE: &str = ".retention.lock";
 const INLINE_LIMIT_ENV: &str = "LOCAL_MCP_INLINE_OUTPUT_BYTES";
 
 #[derive(Debug)]
@@ -29,9 +32,44 @@ struct StreamPreview {
 }
 
 #[derive(Debug)]
+struct ActiveLogLease {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl ActiveLogLease {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("cannot create active log lease {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("cannot lock active log lease {}", path.display()))?;
+        Ok(Self {
+            file: Some(file),
+            path,
+        })
+    }
+}
+
+impl Drop for ActiveLogLease {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            // Closing the handle releases the lease on every supported OS.
+            // Drop it before removing the marker so Windows can unlink it.
+            drop(file);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug)]
 pub struct LogCapturePaths {
     stdout: PathBuf,
     stderr: PathBuf,
+    _lease: ActiveLogLease,
 }
 
 impl LogCapturePaths {
@@ -67,12 +105,30 @@ pub fn resource_uri(job_id: Uuid, stream: &str) -> String {
 }
 
 pub async fn prepare_log_capture(session_id: &str, job_id: Uuid) -> Result<LogCapturePaths> {
-    cleanup_log_storage(session_id).await?;
+    let root = session_log_root(session_id)?;
+    tokio::fs::create_dir_all(&root).await?;
+    let storage_lock = acquire_retention_lock(&root).await?;
+    cleanup_log_storage_with_limit_locked(&root, LOG_RETENTION_DIRECTORIES.saturating_sub(1))
+        .await?;
+    let existing = count_log_directories(&root).await?;
+    anyhow::ensure!(
+        existing < LOG_RETENTION_DIRECTORIES,
+        "command log retention limit reached: {existing} active directories are retained"
+    );
+
     let directory = execution_log_dir(session_id, job_id)?;
-    tokio::fs::create_dir_all(&directory).await?;
+    tokio::fs::create_dir(&directory).await.with_context(|| {
+        format!(
+            "cannot create command log directory {}",
+            directory.display()
+        )
+    })?;
+    let lease = ActiveLogLease::acquire(directory.join(ACTIVE_LEASE_FILE))?;
+    drop(storage_lock);
     Ok(LogCapturePaths {
         stdout: directory.join("stdout"),
         stderr: directory.join("stderr"),
+        _lease: lease,
     })
 }
 
@@ -152,18 +208,48 @@ fn execution_log_dir(session_id: &str, job_id: Uuid) -> Result<PathBuf> {
     Ok(session_log_root(session_id)?.join(job_id.to_string()))
 }
 
-async fn cleanup_log_storage(session_id: &str) -> Result<()> {
-    cleanup_log_storage_with_limit(session_id, LOG_RETENTION_DIRECTORIES.saturating_sub(1)).await
+async fn acquire_retention_lock(root: &Path) -> Result<File> {
+    let path = root.join(RETENTION_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("cannot open command log retention lock {}", path.display()))?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| {
+                    format!("cannot lock command log retention state {}", path.display())
+                });
+            }
+        }
+    }
 }
 
+#[cfg(test)]
 async fn cleanup_log_storage_with_limit(session_id: &str, max_existing: usize) -> Result<()> {
     let root = session_log_root(session_id)?;
-    let mut entries = match tokio::fs::read_dir(&root).await {
+    tokio::fs::create_dir_all(&root).await?;
+    let storage_lock = acquire_retention_lock(&root).await?;
+    let result = cleanup_log_storage_with_limit_locked(&root, max_existing).await;
+    drop(storage_lock);
+    result
+}
+
+async fn cleanup_log_storage_with_limit_locked(root: &Path, max_existing: usize) -> Result<()> {
+    let mut entries = match tokio::fs::read_dir(root).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
     let now = SystemTime::now();
+    let mut active_count = 0_usize;
     let mut retained = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         if !entry.file_type().await?.is_dir() {
@@ -174,6 +260,10 @@ async fn cleanup_log_storage_with_limit(session_id: &str, max_existing: usize) -
             .await
             .and_then(|metadata| metadata.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
+        if active_log_lease_is_locked(&entry.path())? {
+            active_count = active_count.saturating_add(1);
+            continue;
+        }
         let stale = now.duration_since(modified).unwrap_or_default() > LOG_RETENTION_AGE;
         if stale {
             let _ = tokio::fs::remove_dir_all(entry.path()).await;
@@ -187,11 +277,58 @@ async fn cleanup_log_storage_with_limit(session_id: &str, max_existing: usize) -
             .cmp(&right.0)
             .then_with(|| left.1.as_os_str().cmp(right.1.as_os_str()))
     });
-    let remove_count = retained.len().saturating_sub(max_existing);
+    let terminal_limit = max_existing.saturating_sub(active_count);
+    let remove_count = retained.len().saturating_sub(terminal_limit);
     for (_, path) in retained.into_iter().take(remove_count) {
         let _ = tokio::fs::remove_dir_all(path).await;
     }
     Ok(())
+}
+
+fn active_log_lease_is_locked(directory: &Path) -> Result<bool> {
+    let path = directory.join(ACTIVE_LEASE_FILE);
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if active_lease_open_is_locked(&error) => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            Ok(false)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn active_lease_open_is_locked(error: &std::io::Error) -> bool {
+    // ERROR_LOCK_VIOLATION. Wine and some Windows filesystem providers reject
+    // opening a currently locked marker instead of allowing a second handle.
+    error.raw_os_error() == Some(33)
+}
+
+#[cfg(not(windows))]
+fn active_lease_open_is_locked(_error: &std::io::Error) -> bool {
+    false
+}
+
+async fn count_log_directories(root: &Path) -> Result<usize> {
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut count = 0_usize;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
 }
 
 fn bounded_result_value(
@@ -428,6 +565,42 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(session_log_root(&session_id).unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn prepare_preserves_active_logs_when_retention_is_full() {
+        let session_id = format!("output-active-cleanup-{}", Uuid::new_v4());
+        let root = session_log_root(&session_id).unwrap();
+        let active_job = Uuid::new_v4();
+        let active = prepare_log_capture(&session_id, active_job).await.unwrap();
+        let active_directory = execution_log_dir(&session_id, active_job).unwrap();
+        let _writer = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(active.stdout())
+            .await
+            .unwrap();
+
+        for index in 0..LOG_RETENTION_DIRECTORIES.saturating_sub(1) {
+            let directory = root.join(format!("terminal-{index:03}"));
+            tokio::fs::create_dir(&directory).await.unwrap();
+            tokio::fs::write(directory.join("stdout"), b"complete")
+                .await
+                .unwrap();
+        }
+
+        let next_job = Uuid::new_v4();
+        let next = prepare_log_capture(&session_id, next_job).await.unwrap();
+        assert!(active_directory.is_dir());
+        assert!(execution_log_dir(&session_id, next_job).unwrap().is_dir());
+        assert_eq!(
+            count_log_directories(&root).await.unwrap(),
+            LOG_RETENTION_DIRECTORIES
+        );
+
+        drop(next);
+        drop(active);
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[tokio::test]
