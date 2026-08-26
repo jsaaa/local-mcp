@@ -96,6 +96,34 @@ to check for completion or `stop_job` to terminate them. Use `start_command`
 when a command should run in the background immediately without the 30-second
 foreground wait.
 
+### Process-tree lifecycle
+
+Every command is launched with an owned process-tree lifecycle. On Unix,
+local-mcp creates a dedicated process group and signals the entire group. On
+Windows, it uses the documented `taskkill /T` process-tree operation. A requested
+stop first attempts graceful tree termination, waits for a bounded 500 ms grace
+period, and then escalates to a forced tree kill. Direct-child exit does not
+release ownership: before returning, local-mcp verifies that the dedicated Unix
+process group is empty and terminates any background descendants left by a parent
+that exited first. The direct child is always waited and reaped before
+`stop_job` returns.
+
+The same lifecycle primitive is used by explicit stop requests, internal
+execution timeouts, and cancellation cleanup. If an execution future is dropped
+or its Tokio task is aborted, a synchronous Drop guard force-terminates the tree
+instead of relying only on `kill_on_drop` for the direct child. On Windows this
+requires the system `taskkill.exe`, which is part of supported Windows releases.
+
+Command result JSON includes `termination` and `termination_trigger` fields. The
+possible lifecycle results are `exited`, `stopped`, `timeout`, `cancelled`, and
+`forced_kill`; a forced result also identifies whether stop, timeout,
+cancellation, or post-completion descendant cleanup triggered the escalation.
+Normal non-zero process exits remain
+command errors, while lifecycle termination is returned as an inspectable
+terminal outcome. Repeating `stop_job` for a recently stopped in-memory job is
+idempotent and returns the cached terminal result. The cache is bounded to 256
+entries per MCP process.
+
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
 available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands use
