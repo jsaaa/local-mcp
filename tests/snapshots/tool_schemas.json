@@ -274,6 +274,66 @@
   {
     "inputSchema": {
       "additionalProperties": false,
+      "definitions": {
+        "JobLogStream": {
+          "enum": [
+            "stdout",
+            "stderr"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "job_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "length": {
+          "format": "uint64",
+          "maximum": 65536.0,
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        },
+        "stream": {
+          "$ref": "#/definitions/JobLogStream"
+        }
+      },
+      "required": [
+        "job_id",
+        "session_id",
+        "stream"
+      ],
+      "type": "object"
+    },
+    "name": "read_job_log"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
       "properties": {
         "interval_seconds": {
           "format": "uint64",

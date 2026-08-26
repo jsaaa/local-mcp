@@ -11,6 +11,7 @@ use crate::config;
 
 pub const HEARTBEAT_MAX_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 pub const HEARTBEAT_MAX_WAIT_SECONDS: u64 = 25;
+pub const JOB_LOG_MAX_READ_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct SessionId(String);
@@ -218,6 +219,60 @@ impl JsonSchema for HeartbeatWait {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobLogStream {
+    Stdout,
+    Stderr,
+}
+
+impl JobLogStream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct JobLogLength(u64);
+
+impl JobLogLength {
+    pub fn bytes(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl<'de> Deserialize<'de> for JobLogLength {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if !(1..=JOB_LOG_MAX_READ_BYTES).contains(&value) {
+            return Err(serde::de::Error::custom(format!(
+                "length must be between 1 and {JOB_LOG_MAX_READ_BYTES}"
+            )));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl JsonSchema for JobLogLength {
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn schema_name() -> String {
+        "JobLogLength".to_owned()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        bounded_u64_schema(1, JOB_LOG_MAX_READ_BYTES)
+    }
+}
+
 fn session_id_schema() -> Schema {
     let mut schema = constrained_string_schema(1, 64, "^[A-Za-z0-9._-]+$").into_object();
     schema.subschemas = Some(Box::new(SubschemaValidation {
@@ -324,6 +379,18 @@ pub struct PollJobArgs {
 pub struct StopJobArgs {
     pub session_id: SessionId,
     pub job_id: Uuid,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadJobLogArgs {
+    pub session_id: SessionId,
+    pub job_id: Uuid,
+    pub stream: JobLogStream,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub length: Option<JobLogLength>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

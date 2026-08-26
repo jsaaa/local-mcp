@@ -96,23 +96,61 @@ to check for completion or `stop_job` to terminate them. Use `start_command`
 when a command should run in the background immediately without the 30-second
 foreground wait.
 
+### Bounded command output and full logs
+
+Every foreground and background command receives a job ID. While the process is
+running, stdout and stderr are streamed directly to separate files under
+local-mcp's state directory. RAM retains only bounded head/tail previews, so log
+volume cannot grow the server's capture buffers without limit. The inline result
+contains UTF-8-safe previews, original byte counts, truncation flags,
+`termination` metadata, and `local-mcp://jobs/<job-id>/<stream>` identifiers.
+Non-zero exits and bounded stderr previews remain visible for very large output.
+
+The complete serialized JSON-RPC success and process-error envelopes, including
+string re-escaping and a 256-byte serialized request-ID budget, are capped by
+`LOCAL_MCP_INLINE_OUTPUT_BYTES`. Oversized request IDs are rejected before tool
+dispatch. The default is 16384 bytes; configured values are clamped to 2048
+through 1048576 bytes. Command and approval activity previews are bounded
+separately so a large argv or command log cannot flood the permission timeline.
+
+Use `read_job_log` to read a stored stream in bounded ranges:
+
+```json
+{
+  "session_id": "...",
+  "job_id": "...",
+  "stream": "stdout",
+  "offset": 0,
+  "length": 8192
+}
+```
+
+`length` is limited to 65536 bytes per call. Valid UTF-8 ranges are returned as
+text; arbitrary binary ranges are returned as base64. Log paths are derived from
+the owning session, so another session cannot read the same job ID. Active log
+directories are protected by OS file locks. Completed entries older than seven
+days are removed, and at most 128 command-log directories are retained per
+session. If all retained entries are active, starting another capture fails
+closed rather than deleting a running command's logs.
+
 ### Process-tree lifecycle
 
 Every command is launched with an owned process-tree lifecycle. On Unix,
 local-mcp creates a dedicated process group and signals the entire group. On
-Windows, it uses the documented `taskkill /T` process-tree operation. A requested
-stop first attempts graceful tree termination, waits for a bounded 500 ms grace
-period, and then escalates to a forced tree kill. Direct-child exit does not
-release ownership: before returning, local-mcp verifies that the dedicated Unix
-process group is empty and terminates any background descendants left by a parent
-that exited first. The direct child is always waited and reaped before
-`stop_job` returns.
+Windows, it starts the process suspended, assigns it to a Job Object configured
+with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and only then resumes execution. A
+requested stop first attempts graceful tree termination, waits for a bounded
+500 ms grace period, and then escalates to a forced tree kill. Direct-child exit
+does not release ownership: local-mcp verifies that the Unix process group or
+Windows Job Object has no active descendants before returning. The direct child
+is always waited and reaped before `stop_job` returns.
 
 The same lifecycle primitive is used by explicit stop requests, internal
 execution timeouts, and cancellation cleanup. If an execution future is dropped
-or its Tokio task is aborted, a synchronous Drop guard force-terminates the tree
-instead of relying only on `kill_on_drop` for the direct child. On Windows this
-requires the system `taskkill.exe`, which is part of supported Windows releases.
+or its Tokio task is aborted, a synchronous Drop guard terminates the Unix group;
+on Windows, closing the owned Job Object triggers kill-on-close for every
+associated process. Cleanup/query failures are returned as errors rather than
+being reported as normal command exits.
 
 Command result JSON includes `termination` and `termination_trigger` fields. The
 possible lifecycle results are `exited`, `stopped`, `timeout`, `cancelled`, and

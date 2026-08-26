@@ -7,11 +7,14 @@ use anyhow::{Context, Result};
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
 const TERMINATION_GRACE: Duration = Duration::from_millis(500);
+const INTERNAL_CAPTURE_LIMIT: usize = 64 * 1024;
+const STREAM_BUFFER_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StopTrigger {
@@ -71,6 +74,21 @@ pub struct Output {
     pub termination: Termination,
 }
 
+#[derive(Debug)]
+pub struct StreamCapture {
+    pub bytes: u64,
+    pub head: Vec<u8>,
+    pub tail: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct LoggedOutput {
+    pub status: i32,
+    pub stdout: StreamCapture,
+    pub stderr: StreamCapture,
+    pub termination: Termination,
+}
+
 #[derive(Clone)]
 pub struct CommandControl {
     sender: watch::Sender<Option<StopTrigger>>,
@@ -100,26 +118,11 @@ fn absolute(path: &Path) -> Result<AbsolutePathBuf> {
     AbsolutePathBuf::from_absolute_path(path).map_err(|error| anyhow::anyhow!(error))
 }
 
-pub async fn run(
+fn sandboxed_process(
     command: &[String],
     cwd: &Path,
     writable_roots: &[PathBuf],
-    stdin: Option<&[u8]>,
-) -> Result<Output> {
-    let (control, cancellation) = command_control();
-    let result = run_controlled(command, cwd, writable_roots, stdin, cancellation, None).await;
-    drop(control);
-    result
-}
-
-pub async fn run_controlled(
-    command: &[String],
-    cwd: &Path,
-    writable_roots: &[PathBuf],
-    stdin: Option<&[u8]>,
-    cancellation: CommandCancellation,
-    execution_timeout: Option<Duration>,
-) -> Result<Output> {
+) -> Result<Command> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
@@ -199,9 +202,112 @@ pub async fn run_controlled(
         .current_dir(&cwd)
         .env_clear()
         .envs(safe_environment());
-    run_process(process, stdin, cancellation, execution_timeout, "sandboxed").await
+    Ok(process)
 }
 
+fn unrestricted_process(command: &[String], cwd: &Path) -> Result<Command> {
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
+    let mut process = Command::new(&command[0]);
+    process.args(&command[1..]).current_dir(cwd);
+    Ok(process)
+}
+
+pub async fn run(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    let (control, cancellation) = command_control();
+    let result = run_controlled(command, cwd, writable_roots, stdin, cancellation, None).await;
+    drop(control);
+    result
+}
+
+pub async fn run_controlled(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+    cancellation: CommandCancellation,
+    execution_timeout: Option<Duration>,
+) -> Result<Output> {
+    let process = sandboxed_process(command, cwd, writable_roots)?;
+    let output = run_process(
+        process,
+        stdin,
+        cancellation,
+        execution_timeout,
+        "sandboxed",
+        None,
+        None,
+        INTERNAL_CAPTURE_LIMIT,
+    )
+    .await?;
+    Ok(logged_output_to_output(output))
+}
+
+pub async fn run_logged(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    preview_limit: usize,
+) -> Result<LoggedOutput> {
+    let (control, cancellation) = command_control();
+    let result = run_logged_controlled(
+        command,
+        cwd,
+        writable_roots,
+        stdin,
+        cancellation,
+        None,
+        stdout_path,
+        stderr_path,
+        preview_limit,
+    )
+    .await;
+    drop(control);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_logged_controlled(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+    cancellation: CommandCancellation,
+    execution_timeout: Option<Duration>,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    preview_limit: usize,
+) -> Result<LoggedOutput> {
+    let stdout_file = File::create(stdout_path)
+        .await
+        .with_context(|| format!("cannot create stdout log {}", stdout_path.display()))?;
+    let stderr_file = File::create(stderr_path)
+        .await
+        .with_context(|| format!("cannot create stderr log {}", stderr_path.display()))?;
+    let process = sandboxed_process(command, cwd, writable_roots)?;
+    run_process(
+        process,
+        stdin,
+        cancellation,
+        execution_timeout,
+        "sandboxed",
+        Some(stdout_file),
+        Some(stderr_file),
+        preview_limit,
+    )
+    .await
+}
+
+#[allow(dead_code)]
 pub async fn run_unrestricted(
     command: &[String],
     cwd: &Path,
@@ -220,28 +326,87 @@ pub async fn run_unrestricted_controlled(
     cancellation: CommandCancellation,
     execution_timeout: Option<Duration>,
 ) -> Result<Output> {
-    anyhow::ensure!(!command.is_empty(), "command must not be empty");
-    let cwd = std::fs::canonicalize(cwd)
-        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
-    let mut process = Command::new(&command[0]);
-    process.args(&command[1..]).current_dir(cwd);
+    let process = unrestricted_process(command, cwd)?;
+    let output = run_process(
+        process,
+        stdin,
+        cancellation,
+        execution_timeout,
+        "unsandboxed",
+        None,
+        None,
+        INTERNAL_CAPTURE_LIMIT,
+    )
+    .await?;
+    Ok(logged_output_to_output(output))
+}
+
+pub async fn run_unrestricted_logged(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    preview_limit: usize,
+) -> Result<LoggedOutput> {
+    let (control, cancellation) = command_control();
+    let result = run_unrestricted_logged_controlled(
+        command,
+        cwd,
+        stdin,
+        cancellation,
+        None,
+        stdout_path,
+        stderr_path,
+        preview_limit,
+    )
+    .await;
+    drop(control);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_unrestricted_logged_controlled(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    cancellation: CommandCancellation,
+    execution_timeout: Option<Duration>,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    preview_limit: usize,
+) -> Result<LoggedOutput> {
+    let stdout_file = File::create(stdout_path)
+        .await
+        .with_context(|| format!("cannot create stdout log {}", stdout_path.display()))?;
+    let stderr_file = File::create(stderr_path)
+        .await
+        .with_context(|| format!("cannot create stderr log {}", stderr_path.display()))?;
+    let process = unrestricted_process(command, cwd)?;
     run_process(
         process,
         stdin,
         cancellation,
         execution_timeout,
         "unsandboxed",
+        Some(stdout_file),
+        Some(stderr_file),
+        preview_limit,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_process(
     mut process: Command,
     stdin: Option<&[u8]>,
     mut cancellation: CommandCancellation,
     execution_timeout: Option<Duration>,
     context: &str,
-) -> Result<Output> {
+    stdout_file: Option<File>,
+    stderr_file: Option<File>,
+    preview_limit: usize,
+) -> Result<LoggedOutput> {
     let prepared_tree = prepare_process_tree(&mut process)?;
     process
         .kill_on_drop(true)
@@ -281,45 +446,117 @@ async fn run_process(
         .stderr
         .take()
         .context("command stderr was not piped")?;
-    let stdout_task = tokio::spawn(read_all(stdout));
-    let stderr_task = tokio::spawn(read_all(stderr));
 
-    let event = wait_event(&mut child, &mut cancellation, execution_timeout).await;
-    let (status, termination) = match event {
-        WaitEvent::Exited(status) => {
-            let status = status.context("failed to wait for command")?;
-            let forced_cleanup = tree.cleanup_after_direct_exit(false).await?;
-            let termination = if forced_cleanup {
-                Termination::ForcedKill(StopTrigger::Completion)
-            } else {
-                Termination::Exited
-            };
-            (status, termination)
+    let lifecycle = async {
+        let event = wait_event(&mut child, &mut cancellation, execution_timeout).await;
+        match event {
+            WaitEvent::Exited(status) => {
+                let status = status.context("failed to wait for command")?;
+                let forced_cleanup = tree.cleanup_after_direct_exit(false).await?;
+                let termination = if forced_cleanup {
+                    Termination::ForcedKill(StopTrigger::Completion)
+                } else {
+                    Termination::Exited
+                };
+                Ok::<_, anyhow::Error>((status, termination))
+            }
+            WaitEvent::Triggered(trigger) => {
+                terminate_and_reap(&mut child, &mut tree, trigger).await
+            }
         }
-        WaitEvent::Triggered(trigger) => terminate_and_reap(&mut child, &mut tree, trigger).await?,
     };
 
-    let stdout = stdout_task
-        .await
-        .context("stdout reader task failed")?
-        .context("failed to read command stdout")?;
-    let stderr = stderr_task
-        .await
-        .context("stderr reader task failed")?
-        .context("failed to read command stderr")?;
+    let ((status, termination), stdout, stderr) = tokio::try_join!(
+        lifecycle,
+        async {
+            pump_stream(stdout, stdout_file, preview_limit)
+                .await
+                .context("failed to capture command stdout")
+        },
+        async {
+            pump_stream(stderr, stderr_file, preview_limit)
+                .await
+                .context("failed to capture command stderr")
+        },
+    )?;
 
-    Ok(Output {
+    Ok(LoggedOutput {
         status: status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout,
+        stderr,
         termination,
     })
 }
 
-async fn read_all(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
-    Ok(bytes)
+async fn pump_stream<R>(
+    mut reader: R,
+    mut file: Option<File>,
+    preview_limit: usize,
+) -> Result<StreamCapture>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut capture = StreamCapture {
+        bytes: 0,
+        head: Vec::with_capacity(preview_limit.min(STREAM_BUFFER_BYTES)),
+        tail: Vec::with_capacity(preview_limit.min(STREAM_BUFFER_BYTES)),
+    };
+    let mut buffer = vec![0_u8; STREAM_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        if let Some(file) = file.as_mut() {
+            file.write_all(chunk).await?;
+        }
+        capture.bytes = capture.bytes.saturating_add(read as u64);
+        let head_remaining = preview_limit.saturating_sub(capture.head.len());
+        capture
+            .head
+            .extend_from_slice(&chunk[..chunk.len().min(head_remaining)]);
+        update_tail(&mut capture.tail, chunk, preview_limit);
+    }
+    if let Some(file) = file.as_mut() {
+        file.flush().await?;
+    }
+    Ok(capture)
+}
+
+fn update_tail(tail: &mut Vec<u8>, chunk: &[u8], limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if chunk.len() >= limit {
+        tail.clear();
+        tail.extend_from_slice(&chunk[chunk.len() - limit..]);
+        return;
+    }
+    let overflow = tail.len().saturating_add(chunk.len()).saturating_sub(limit);
+    if overflow > 0 {
+        tail.drain(..overflow);
+    }
+    tail.extend_from_slice(chunk);
+}
+
+fn bounded_stream_bytes(capture: StreamCapture) -> Vec<u8> {
+    if capture.bytes <= capture.head.len() as u64 {
+        return capture.head;
+    }
+    let mut bytes = capture.head;
+    bytes.extend_from_slice(b"\n... output truncated ...\n");
+    bytes.extend_from_slice(&capture.tail);
+    bytes
+}
+
+fn logged_output_to_output(output: LoggedOutput) -> Output {
+    Output {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&bounded_stream_bytes(output.stdout)).into_owned(),
+        stderr: String::from_utf8_lossy(&bounded_stream_bytes(output.stderr)).into_owned(),
+        termination: output.termination,
+    }
 }
 
 enum WaitEvent {
@@ -1089,6 +1326,46 @@ mod process_tree_tests {
         assert!(task.await.unwrap_err().is_cancelled());
         wait_until_gone([process_ids.0, process_ids.1]).await;
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod streaming_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn unrestricted_output_streams_to_files_with_bounded_memory_previews() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-stream-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await?;
+        let stdout_path = directory.join("stdout");
+        let stderr_path = directory.join("stderr");
+        let output = run_unrestricted_logged(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "head -c 1048576 /dev/zero; printf failure >&2".into(),
+            ],
+            &directory,
+            None,
+            &stdout_path,
+            &stderr_path,
+            1024,
+        )
+        .await?;
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.termination, Termination::Exited);
+        assert_eq!(output.stdout.bytes, 1_048_576);
+        assert!(output.stdout.head.len() <= 1024);
+        assert!(output.stdout.tail.len() <= 1024);
+        assert_eq!(output.stderr.bytes, 7);
+        assert_eq!(tokio::fs::metadata(&stdout_path).await?.len(), 1_048_576);
+        assert_eq!(tokio::fs::read(&stderr_path).await?, b"failure");
+
+        tokio::fs::remove_dir_all(directory).await?;
+        Ok(())
     }
 }
 
