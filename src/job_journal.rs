@@ -148,6 +148,12 @@ pub fn create_running(
         MAX_JOBS_PER_SESSION.saturating_sub(1),
         RETENTION_AGE,
     )?;
+    let retained = count_job_directories_locked(session_id)?;
+    anyhow::ensure!(
+        retained < MAX_JOBS_PER_SESSION,
+        "job journal limit reached: {MAX_JOBS_PER_SESSION} records are already retained for this session"
+    );
+
     let now = now_ms();
     let record = JobRecord {
         version: JOURNAL_VERSION,
@@ -536,6 +542,22 @@ fn cleanup_locked(session_id: &str, max_jobs: usize, retention_age: Duration) ->
     Ok(())
 }
 
+fn count_job_directories_locked(session_id: &str) -> Result<usize> {
+    let root = session_root(session_id)?;
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut count = 0_usize;
+    for entry in entries {
+        if entry?.file_type()?.is_dir() {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
 fn sync_directory(path: &Path) {
     if let Ok(directory) = File::open(path) {
         let _ = directory.sync_all();
@@ -885,6 +907,40 @@ mod tests {
         assert!(!job_root(&session_id, ids[0]).unwrap().exists());
         assert!(job_root(&session_id, ids[1]).unwrap().exists());
         assert!(job_root(&session_id, ids[2]).unwrap().exists());
+        remove_session_for_tests(&session_id);
+    }
+
+    #[test]
+    fn running_records_cannot_exceed_the_hard_session_limit() {
+        let session_id = format!("journal-running-limit-{}", Uuid::new_v4());
+        for index in 0..MAX_JOBS_PER_SESSION {
+            create_running(
+                &session_id,
+                Uuid::new_v4(),
+                format!("running job {index}"),
+                PathBuf::from("/workspace"),
+                ExecutionMode::Sandboxed,
+            )
+            .unwrap();
+        }
+
+        let error = create_running(
+            &session_id,
+            Uuid::new_v4(),
+            "one job too many".to_owned(),
+            PathBuf::from("/workspace"),
+            ExecutionMode::Sandboxed,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("job journal limit reached"));
+        {
+            let _guard = journal_lock().lock().unwrap();
+            assert_eq!(
+                count_job_directories_locked(&session_id).unwrap(),
+                MAX_JOBS_PER_SESSION
+            );
+        }
         remove_session_for_tests(&session_id);
     }
 }
