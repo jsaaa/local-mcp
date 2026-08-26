@@ -21,6 +21,8 @@ use crate::{
 };
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const SHELL_PROGRAM: &str = "bash";
+const SHELL_PREVIEW_LIMIT: usize = 160;
 const REGISTERED_JOB_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const HEARTBEAT_DEFAULT_NAME: &str = "default";
 const IMAGE_VIEWER_URI: &str = "ui://local-mcp/image-viewer-v1.html";
@@ -361,6 +363,7 @@ enum ToolName {
     ListDirectory,
     WriteFile,
     Execute,
+    ExecuteShell,
     StartCommand,
     PollJob,
     StopJob,
@@ -372,16 +375,18 @@ enum ToolName {
     HeartbeatStop,
     StartWithoutSandbox,
     WithoutSandbox,
+    WithoutSandboxShell,
 }
 
 impl ToolName {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 19] = [
         Self::SessionInfo,
         Self::ReadFile,
         Self::GetImage,
         Self::ListDirectory,
         Self::WriteFile,
         Self::Execute,
+        Self::ExecuteShell,
         Self::StartCommand,
         Self::PollJob,
         Self::StopJob,
@@ -393,6 +398,7 @@ impl ToolName {
         Self::HeartbeatStop,
         Self::StartWithoutSandbox,
         Self::WithoutSandbox,
+        Self::WithoutSandboxShell,
     ];
 
     fn as_str(self) -> &'static str {
@@ -403,6 +409,7 @@ impl ToolName {
             Self::ListDirectory => "list_directory",
             Self::WriteFile => "write_file",
             Self::Execute => "execute",
+            Self::ExecuteShell => "execute_shell",
             Self::StartCommand => "start_command",
             Self::PollJob => "poll_job",
             Self::StopJob => "stop_job",
@@ -414,6 +421,7 @@ impl ToolName {
             Self::HeartbeatStop => "heartbeat_stop",
             Self::StartWithoutSandbox => "start_without_sandbox",
             Self::WithoutSandbox => "without_sandbox",
+            Self::WithoutSandboxShell => "without_sandbox_shell",
         }
     }
 
@@ -425,11 +433,13 @@ impl ToolName {
         matches!(
             self,
             Self::Execute
+                | Self::ExecuteShell
                 | Self::StartCommand
                 | Self::PollJob
                 | Self::StopJob
                 | Self::StartWithoutSandbox
                 | Self::WithoutSandbox
+                | Self::WithoutSandboxShell
         )
     }
 
@@ -441,6 +451,7 @@ impl ToolName {
             Self::ListDirectory => generated_schema::<ListDirectoryArgs>(),
             Self::WriteFile => generated_schema::<WriteFileArgs>(),
             Self::Execute => generated_schema::<ExecuteArgs>(),
+            Self::ExecuteShell => generated_schema::<ExecuteShellArgs>(),
             Self::StartCommand => generated_schema::<StartCommandArgs>(),
             Self::PollJob => generated_schema::<PollJobArgs>(),
             Self::StopJob => generated_schema::<StopJobArgs>(),
@@ -452,6 +463,7 @@ impl ToolName {
             Self::HeartbeatStop => generated_schema::<HeartbeatStopArgs>(),
             Self::StartWithoutSandbox => generated_schema::<StartWithoutSandboxArgs>(),
             Self::WithoutSandbox => generated_schema::<WithoutSandboxArgs>(),
+            Self::WithoutSandboxShell => generated_schema::<WithoutSandboxShellArgs>(),
         }
     }
 }
@@ -480,6 +492,15 @@ fn tools() -> Value {
     #[cfg(windows)]
     let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
 
+    #[cfg(not(windows))]
+    let execute_shell_description = "Execute a multi-line Bash program in the Codex sandbox. Pass the program in script as a string; pipelines, heredocs, and set -euo pipefail are supported. Returns the normal result within 30 seconds or a job_id afterward. Network is disabled and approval is not required.";
+    #[cfg(windows)]
+    let execute_shell_description = "Shell-program execution is unsupported on Windows. Use execute with an explicit PowerShell argv command instead.";
+    #[cfg(not(windows))]
+    let without_sandbox_shell_description = "Execute a multi-line Bash program directly on the host with full user permissions and network access. Pass the program in script as a string. Approval is required before launch unless the session is in yolo mode; long-running work returns a job_id.";
+    #[cfg(windows)]
+    let without_sandbox_shell_description = "Shell-program execution is unsupported on Windows. Use without_sandbox with an explicit PowerShell argv command instead.";
+
     let values = ToolName::ALL
         .into_iter()
         .map(|tool| {
@@ -498,6 +519,7 @@ fn tools() -> Value {
                 }
                 ToolName::WriteFile => write_file_description,
                 ToolName::Execute => execute_description,
+                ToolName::ExecuteShell => execute_shell_description,
                 ToolName::StartCommand => start_command_description,
                 ToolName::PollJob => {
                     "Poll a background command returned by execute or start_command. Returns running while active, or the persisted terminal result; completed, failed, stopped, and orphaned states remain queryable after restart."
@@ -529,6 +551,7 @@ fn tools() -> Value {
                 ToolName::WithoutSandbox => {
                     "Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode."
                 }
+                ToolName::WithoutSandboxShell => without_sandbox_shell_description,
             };
             let mut definition = json!({
                 "name": tool.as_str(),
@@ -637,6 +660,14 @@ async fn call_tool(params: &Value) -> Result<Value> {
             let session = config::load_session(args.session_id.as_str()).await?;
             execute(&args, &session).await
         }
+        ToolName::ExecuteShell => {
+            let args: ExecuteShellArgs = match parse_command_arguments(tool, &raw_args) {
+                Ok(args) => args,
+                Err(result) => return Ok(result),
+            };
+            let session = config::load_session(args.session_id.as_str()).await?;
+            execute_shell(&args, &session).await
+        }
         ToolName::StartCommand => {
             let args: StartCommandArgs = match parse_command_arguments(tool, &raw_args) {
                 Ok(args) => args,
@@ -706,6 +737,14 @@ async fn call_tool(params: &Value) -> Result<Value> {
             };
             let session = config::load_session(args.session_id.as_str()).await?;
             without_sandbox(&args, &session).await
+        }
+        ToolName::WithoutSandboxShell => {
+            let args: WithoutSandboxShellArgs = match parse_command_arguments(tool, &raw_args) {
+                Ok(args) => args,
+                Err(result) => return Ok(result),
+            };
+            let session = config::load_session(args.session_id.as_str()).await?;
+            without_sandbox_shell(&args, &session).await
         }
     }
 }
@@ -1051,6 +1090,49 @@ async fn execute(args: &ExecuteArgs, session: &config::Session) -> Result<Value>
     }
 }
 
+async fn execute_shell(args: &ExecuteShellArgs, session: &config::Session) -> Result<Value> {
+    let command = match shell_command(&args.script) {
+        Ok(command) => command,
+        Err(error) => {
+            return Ok(CommandOutcome::invalid_arguments(format!("{error:#}")).tool_result());
+        }
+    };
+    let rendered_command = shell_activity_label(&args.script);
+    let approval_detail = format!("shell: {SHELL_PROGRAM}\n{rendered_command}");
+    let (job_id, rendered_command, mut handle, control) = match spawn_sandboxed_command_named(
+        "execute_shell",
+        command,
+        args.cwd.as_deref(),
+        rendered_command,
+        approval_detail,
+        session,
+    )
+    .await
+    {
+        Ok(job) => job,
+        Err(outcome) => return Ok(outcome.tool_result()),
+    };
+
+    match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
+        Ok(joined) => {
+            drop(control);
+            let outcome = settle_joined_outcome(&session.id, job_id, joined);
+            Ok(outcome.tool_result())
+        }
+        Err(_) => {
+            store_job(
+                job_id,
+                session,
+                rendered_command,
+                handle,
+                control,
+                "Backgrounded",
+            )
+            .await
+        }
+    }
+}
+
 async fn start_command(args: &StartCommandArgs, session: &config::Session) -> Result<Value> {
     let (job_id, rendered_command, handle, control) = match spawn_sandboxed_command(
         "start_command",
@@ -1089,19 +1171,44 @@ async fn spawn_sandboxed_command(
     CommandOutcome,
 > {
     let command = command.to_vec();
+    let rendered_command = render_command(&command);
+    let approval_detail = format!("argv preview: {rendered_command}");
+    spawn_sandboxed_command_named(
+        operation,
+        command,
+        requested_cwd,
+        rendered_command,
+        approval_detail,
+        session,
+    )
+    .await
+}
+
+async fn spawn_sandboxed_command_named(
+    operation: &str,
+    command: Vec<String>,
+    requested_cwd: Option<&str>,
+    rendered_command: String,
+    approval_detail: String,
+    session: &config::Session,
+) -> std::result::Result<
+    (
+        Uuid,
+        String,
+        JoinHandle<CommandOutcome>,
+        sandbox::CommandControl,
+    ),
+    CommandOutcome,
+> {
     let cwd = cwd(requested_cwd, &session.cwd)
         .map_err(|error| CommandOutcome::invalid_arguments(format!("{error:#}")))?;
-    let rendered_command = render_command(&command);
     #[cfg(windows)]
     {
-        let approved = approvals::request(
-            &session.id,
-            operation,
-            format!("argv preview: {rendered_command}"),
-            cwd.clone(),
-        )
-        .await
-        .map_err(|error| CommandOutcome::internal(format!("Approval request failed: {error:#}")))?;
+        let approved = approvals::request(&session.id, operation, approval_detail, cwd.clone())
+            .await
+            .map_err(|error| {
+                CommandOutcome::internal(format!("Approval request failed: {error:#}"))
+            })?;
         if !approved {
             return Err(CommandOutcome::approval_denied(format!(
                 "Approval was denied for {operation}; command was not started."
@@ -1109,7 +1216,7 @@ async fn spawn_sandboxed_command(
         }
     }
     #[cfg(not(windows))]
-    let _ = operation;
+    let _ = (operation, approval_detail);
     let mut roots = session.permitted_directories.clone();
     if !roots.iter().any(|root| cwd.starts_with(root)) {
         roots.push(cwd.clone());
@@ -1399,6 +1506,190 @@ async fn read_job_log(args: &ReadJobLogArgs, session: &config::Session) -> Resul
     text_result(serde_json::to_string_pretty(&result)?)
 }
 
+fn shell_command(script: &str) -> Result<Vec<String>> {
+    #[cfg(unix)]
+    {
+        Ok(vec![
+            SHELL_PROGRAM.to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+        ])
+    }
+    #[cfg(windows)]
+    {
+        let _ = script;
+        anyhow::bail!(
+            "shell-program tools are unsupported on Windows; invoke PowerShell explicitly with an argv tool"
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = script;
+        anyhow::bail!("shell-program tools are unsupported on this platform")
+    }
+}
+
+fn shell_activity_label(script: &str) -> String {
+    format!(
+        "{SHELL_PROGRAM} script ({} bytes; preview: {})",
+        script.len(),
+        shell_script_preview(script)
+    )
+}
+
+fn shell_script_preview(script: &str) -> String {
+    let preview = script
+        .split('\n')
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            Some(if shell_line_is_sensitive(line) {
+                "[redacted sensitive line]".to_owned()
+            } else {
+                escape_terminal_controls(line)
+            })
+        })
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ⏎ ");
+    let preview = if preview.is_empty() {
+        "<empty>".to_owned()
+    } else {
+        preview
+    };
+    bound_utf8_preview(&preview, SHELL_PREVIEW_LIMIT)
+}
+
+fn shell_line_is_sensitive(line: &str) -> bool {
+    let normalized = line
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    [
+        "authorization",
+        "bearer",
+        "cookie",
+        "credential",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "apikey",
+        "accesskey",
+        "clientsecret",
+        "privatekey",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn escape_terminal_controls(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{1b}' => escaped.push_str("\\x1b"),
+            character if terminal_unsafe_character(character) => {
+                let code = character as u32;
+                if code <= 0xff {
+                    escaped.push_str(&format!("\\x{code:02x}"));
+                } else {
+                    escaped.push_str(&format!("\\u{{{code:x}}}"));
+                }
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn terminal_unsafe_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
+}
+
+fn bound_utf8_preview(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    const ELLIPSIS: &str = "...";
+    let mut end = max_bytes.saturating_sub(ELLIPSIS.len()).min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ELLIPSIS}", &text[..end])
+}
+
+async fn without_sandbox_shell(
+    args: &WithoutSandboxShellArgs,
+    session: &config::Session,
+) -> Result<Value> {
+    let command = match shell_command(&args.script) {
+        Ok(command) => command,
+        Err(error) => {
+            return Ok(CommandOutcome::invalid_arguments(format!("{error:#}")).tool_result());
+        }
+    };
+    without_sandbox_shell_with_timeout(
+        command,
+        args.cwd.as_deref(),
+        shell_activity_label(&args.script),
+        session,
+        FOREGROUND_TIMEOUT,
+    )
+    .await
+}
+
+async fn without_sandbox_shell_with_timeout(
+    command: Vec<String>,
+    requested_cwd: Option<&str>,
+    rendered_command: String,
+    session: &config::Session,
+    foreground_timeout: Duration,
+) -> Result<Value> {
+    let approval_detail = format!("shell: {SHELL_PROGRAM}\n{rendered_command}");
+    let (mut registration, rendered_command) = match spawn_unrestricted_job_named(
+        "without_sandbox_shell",
+        command,
+        requested_cwd,
+        rendered_command,
+        approval_detail,
+        session,
+    )
+    .await
+    {
+        Ok(job) => job,
+        Err(outcome) => return Ok(outcome.tool_result()),
+    };
+    let job_id = registration.id();
+
+    match wait_for_registered_job(job_id, session, foreground_timeout).await {
+        Ok(Some(outcome)) => {
+            registration.disarm();
+            Ok(outcome.tool_result())
+        }
+        Ok(None) => {
+            let result =
+                running_registered_job_result(session, &rendered_command, job_id, "Backgrounded")
+                    .await;
+            registration.disarm();
+            Ok(result)
+        }
+        Err(outcome) => Ok(outcome.tool_result()),
+    }
+}
+
 async fn without_sandbox(args: &WithoutSandboxArgs, session: &config::Session) -> Result<Value> {
     without_sandbox_with_timeout(
         args.command.as_slice(),
@@ -1467,17 +1758,32 @@ async fn spawn_unrestricted_job(
     session: &config::Session,
 ) -> std::result::Result<(RegisteredJobGuard, String), CommandOutcome> {
     let command = command.to_vec();
-    let cwd = cwd(requested_cwd, &session.cwd)
-        .map_err(|error| CommandOutcome::invalid_arguments(format!("{error:#}")))?;
     let rendered_command = render_command(&command);
-    let approved = approvals::request(
-        &session.id,
+    let approval_detail = format!("argv preview: {rendered_command}");
+    spawn_unrestricted_job_named(
         operation,
-        format!("argv preview: {rendered_command}"),
-        cwd.clone(),
+        command,
+        requested_cwd,
+        rendered_command,
+        approval_detail,
+        session,
     )
     .await
-    .map_err(|error| CommandOutcome::internal(format!("Approval request failed: {error:#}")))?;
+}
+
+async fn spawn_unrestricted_job_named(
+    operation: &str,
+    command: Vec<String>,
+    requested_cwd: Option<&str>,
+    rendered_command: String,
+    approval_detail: String,
+    session: &config::Session,
+) -> std::result::Result<(RegisteredJobGuard, String), CommandOutcome> {
+    let cwd = cwd(requested_cwd, &session.cwd)
+        .map_err(|error| CommandOutcome::invalid_arguments(format!("{error:#}")))?;
+    let approved = approvals::request(&session.id, operation, approval_detail, cwd.clone())
+        .await
+        .map_err(|error| CommandOutcome::internal(format!("Approval request failed: {error:#}")))?;
     if !approved {
         return Err(CommandOutcome::approval_denied(format!(
             "Approval was denied for {operation}; command was not started."
@@ -2002,11 +2308,13 @@ mod tests {
         let tools = tools();
         for name in [
             "execute",
+            "execute_shell",
             "start_command",
             "poll_job",
             "stop_job",
             "start_without_sandbox",
             "without_sandbox",
+            "without_sandbox_shell",
         ] {
             let tool = tools
                 .as_array()
@@ -2025,6 +2333,172 @@ mod tests {
                 .unwrap();
             assert!(tool.get("outputSchema").is_none());
         }
+    }
+
+    #[test]
+    fn shell_tools_use_string_schemas_without_changing_argv_tools() {
+        let tools = tools();
+        let find = |name: &str| {
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()
+        };
+
+        for name in ["execute_shell", "without_sandbox_shell"] {
+            let tool = find(name);
+            assert_eq!(
+                tool["inputSchema"]["properties"]["script"]["type"],
+                "string"
+            );
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert!(tool["inputSchema"]["properties"].get("command").is_none());
+            assert!(
+                tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("script"))
+            );
+            assert_eq!(tool["outputSchema"], command_result::output_schema());
+        }
+
+        assert_eq!(
+            find("execute")["inputSchema"]["properties"]["command"]["type"],
+            "array"
+        );
+        assert_eq!(
+            find("without_sandbox")["inputSchema"]["properties"]["command"]["type"],
+            "array"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_command_uses_bash_and_preserves_multiline_programs() {
+        let script = "set -euo pipefail\nprintf '%s\\n' hello | sed 's/hello/world/'\ncat <<'EOF'\ndone\nEOF";
+        let command = shell_command(script).unwrap();
+        assert_eq!(command, vec!["bash", "-c", script]);
+    }
+
+    #[test]
+    fn shell_activity_preview_is_terminal_safe_bounded_and_redacted() {
+        let script = format!(
+            "echo safe\x1b[2J\rforged\x07\nX-API-Key: {}\necho {}\nfourth line",
+            "x".repeat(200),
+            "日本語".repeat(300)
+        );
+        let preview = shell_script_preview(&script);
+        assert!(preview.contains("echo safe\\x1b[2J\\rforged\\x07"));
+        assert!(preview.contains("[redacted sensitive line]"));
+        assert!(!preview.contains('\x1b'));
+        assert!(!preview.contains('\r'));
+        assert!(!preview.contains('\x07'));
+        assert!(!preview.contains(&"x".repeat(20)));
+        assert!(!preview.contains("fourth line"));
+        assert!(preview.matches(" ⏎ ").count() <= 2);
+        assert!(preview.len() <= SHELL_PREVIEW_LIMIT);
+    }
+
+    #[test]
+    fn shell_activity_preview_escapes_c1_and_bidi_controls() {
+        let preview = shell_script_preview("printf '\u{009b}31mspoof\u{202e}'");
+        assert!(preview.contains("\\x9b"));
+        assert!(preview.contains("\\u{202e}"));
+        assert!(!preview.contains('\u{009b}'));
+        assert!(!preview.contains('\u{202e}'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn denied_shell_approval_never_starts_the_process() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-shell-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let marker = directory.join("should-not-exist");
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "without_sandbox_shell", "deny")
+                .await;
+        let args: WithoutSandboxShellArgs = serde_json::from_value(json!({
+            "session_id": session.id,
+            "script": format!("printf started > {}", marker.display())
+        }))
+        .unwrap();
+
+        let result = without_sandbox_shell(&args, &session).await.unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(result["structuredContent"]["error_kind"], "approval_denied");
+        assert!(!marker.exists());
+        assert_eq!(
+            jobs()
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|job| job.session_id == session.id)
+                .count(),
+            0
+        );
+        cleanup_unrestricted_test(&session, &directory).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_shell_executes_multiline_pipeline_and_heredoc() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-shell-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "without_sandbox_shell", "allow")
+                .await;
+        let script =
+            "set -euo pipefail\ncat <<'EOF' | sed 's/hello/world/' > result.txt\nhello\nEOF";
+        let args: WithoutSandboxShellArgs = serde_json::from_value(json!({
+            "session_id": session.id,
+            "script": script
+        }))
+        .unwrap();
+
+        let result = without_sandbox_shell(&args, &session).await.unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(result["structuredContent"]["status"], "completed");
+        assert_eq!(
+            tokio::fs::read_to_string(directory.join("result.txt"))
+                .await
+                .unwrap()
+                .trim(),
+            "world"
+        );
+        cleanup_unrestricted_test(&session, &directory).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_shell_honors_cwd_and_reports_nonzero_exit() {
+        let directory = std::env::temp_dir().join(format!("local-mcp-shell-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = unrestricted_test_session(&directory);
+        let responder =
+            start_unrestricted_approval_responder(&session.id, "without_sandbox_shell", "allow")
+                .await;
+        let args: WithoutSandboxShellArgs = serde_json::from_value(json!({
+            "session_id": session.id,
+            "script": "pwd > cwd.txt\nexit 7"
+        }))
+        .unwrap();
+
+        let result = without_sandbox_shell(&args, &session).await.unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(result["structuredContent"]["error_kind"], "process_exit");
+        assert_eq!(result["structuredContent"]["exit_code"], 7);
+        let recorded = tokio::fs::read_to_string(directory.join("cwd.txt"))
+            .await
+            .unwrap();
+        assert_eq!(recorded.trim(), directory.to_string_lossy());
+        cleanup_unrestricted_test(&session, &directory).await;
     }
 
     #[test]
@@ -2631,6 +3105,9 @@ mod tests {
             | ToolName::WithoutSandbox => {
                 json!({"session_id": session_id, "command": ["true"]})
             }
+            ToolName::ExecuteShell | ToolName::WithoutSandboxShell => {
+                json!({"session_id": session_id, "script": "true"})
+            }
             ToolName::PollJob | ToolName::StopJob => json!({
                 "session_id": session_id,
                 "job_id": "00000000-0000-4000-8000-000000000001"
@@ -2670,6 +3147,9 @@ mod tests {
             ToolName::Execute => {
                 let _: ExecuteArgs = parse_arguments(tool, value)?;
             }
+            ToolName::ExecuteShell => {
+                let _: ExecuteShellArgs = parse_arguments(tool, value)?;
+            }
             ToolName::StartCommand => {
                 let _: StartCommandArgs = parse_arguments(tool, value)?;
             }
@@ -2702,6 +3182,9 @@ mod tests {
             }
             ToolName::WithoutSandbox => {
                 let _: WithoutSandboxArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::WithoutSandboxShell => {
+                let _: WithoutSandboxShellArgs = parse_arguments(tool, value)?;
             }
         }
         Ok(())
@@ -3072,6 +3555,8 @@ mod tests {
             ToolName::HeartbeatWait,
             ToolName::HeartbeatStatus,
             ToolName::HeartbeatStop,
+            ToolName::ExecuteShell,
+            ToolName::WithoutSandboxShell,
         ];
         for tool in ToolName::ALL {
             let schema = tool.input_schema();

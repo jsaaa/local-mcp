@@ -63,6 +63,43 @@ Every tool takes a `session_id`. The agent can call `session_info` with the ID
 from the prompt to confirm the working directory and sandbox roots. One
 `local-mcp mcp` process can therefore serve multiple independently configured
 sessions.
+
+### Argv commands and shell programs
+
+Use `execute`, `start_command`, and `without_sandbox` for direct process execution.
+Their `command` field is always an argv array, so no shell parsing or implicit
+quoting occurs:
+
+```json
+{"session_id":"...","command":["cargo","test","--locked"],"cwd":"."}
+```
+
+On Unix, use `execute_shell` for a sandboxed multi-line Bash program and
+`without_sandbox_shell` for an approved host Bash program. Their `script` field is
+a string and supports pipelines, heredocs, conditionals, and
+`set -euo pipefail`:
+
+```json
+{
+  "session_id": "...",
+  "script": "set -euo pipefail\nprintf '%s\n' hello | sed 's/hello/world/'",
+  "cwd": "."
+}
+```
+
+`execute_shell` has the same filesystem sandbox and denied network access as
+`execute`. `without_sandbox_shell` has full host permissions and network access,
+so approval is requested before Bash starts unless the session is in yolo mode.
+Activity output names Bash and includes only a bounded preview with common
+credential-bearing lines redacted and terminal control characters escaped. The
+complete script is not dumped into the activity timeline. `execute_shell` follows
+the same 30-second foreground/background lifecycle as `execute`, while
+`without_sandbox_shell` follows the approved unrestricted lifecycle described
+below.
+
+The shell-program tools are intentionally unsupported on Windows because silently
+mapping Bash semantics to PowerShell would be unsafe. On Windows, invoke
+PowerShell explicitly through an argv tool instead.
 `get_image` returns PNG, JPEG, GIF, WebP, BMP, TIFF, and AVIF files as native MCP
 image content. Relative image paths are resolved from the session working directory.
 

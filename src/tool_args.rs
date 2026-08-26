@@ -418,6 +418,15 @@ pub struct StartCommandArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ExecuteShellArgs {
+    pub session_id: SessionId,
+    pub script: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PollJobArgs {
     pub session_id: SessionId,
     pub job_id: Uuid,
@@ -493,6 +502,15 @@ pub struct HeartbeatStopArgs {
 pub struct StartWithoutSandboxArgs {
     pub session_id: SessionId,
     pub command: CommandArgv,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WithoutSandboxShellArgs {
+    pub session_id: SessionId,
+    pub script: String,
     #[serde(default)]
     pub cwd: Option<String>,
 }

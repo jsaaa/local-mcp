@@ -177,6 +177,41 @@
   },
   {
     "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "script": {
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "script",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "execute_shell"
+  },
+  {
+    "inputSchema": {
       "properties": {
         "command": {
           "items": {
@@ -618,5 +653,40 @@
       "type": "object"
     },
     "name": "without_sandbox"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "script": {
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "script",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "without_sandbox_shell"
   }
 ]
