@@ -16,9 +16,10 @@ codex-utils-absolute-path = { git = "https://github.com/openai/codex", rev = "20
 dirs = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = { version = "0.8.22", features = ["uuid1"] }
 similar = "2"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 # starlark 0.13 uses hashbrown 0.14. allocative 0.3.5+ moved its
 # hashbrown integration to a newer, type-incompatible release.
 allocative = "=0.3.4"
@@ -35,3 +36,6 @@ codex-sandboxing = { git = "https://github.com/openai/codex", rev = "20fedafff83
 
 [target.'cfg(target_os = "linux")'.dependencies]
 codex-linux-sandbox = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
+
+[dev-dependencies]
+jsonschema = { version = "0.51", default-features = false }

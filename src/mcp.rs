@@ -5,18 +5,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::tool_args::*;
 use crate::{approvals, config, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const HEARTBEAT_DEFAULT_NAME: &str = "default";
-const HEARTBEAT_MAX_WAIT: Duration = Duration::from_secs(25);
-const HEARTBEAT_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const IMAGE_VIEWER_URI: &str = "ui://local-mcp/image-viewer-v1.html";
 const MCP_APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
 const IMAGE_VIEWER_HTML: &str = r#"<!doctype html>
@@ -289,6 +290,95 @@ fn read_resource(params: &Value) -> Result<Value> {
     }))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum ToolName {
+    SessionInfo,
+    ReadFile,
+    GetImage,
+    ListDirectory,
+    WriteFile,
+    Execute,
+    StartCommand,
+    PollJob,
+    StopJob,
+    HeartbeatStart,
+    HeartbeatWait,
+    HeartbeatStatus,
+    HeartbeatStop,
+    WithoutSandbox,
+}
+
+impl ToolName {
+    const ALL: [Self; 14] = [
+        Self::SessionInfo,
+        Self::ReadFile,
+        Self::GetImage,
+        Self::ListDirectory,
+        Self::WriteFile,
+        Self::Execute,
+        Self::StartCommand,
+        Self::PollJob,
+        Self::StopJob,
+        Self::HeartbeatStart,
+        Self::HeartbeatWait,
+        Self::HeartbeatStatus,
+        Self::HeartbeatStop,
+        Self::WithoutSandbox,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionInfo => "session_info",
+            Self::ReadFile => "read_file",
+            Self::GetImage => "get_image",
+            Self::ListDirectory => "list_directory",
+            Self::WriteFile => "write_file",
+            Self::Execute => "execute",
+            Self::StartCommand => "start_command",
+            Self::PollJob => "poll_job",
+            Self::StopJob => "stop_job",
+            Self::HeartbeatStart => "heartbeat_start",
+            Self::HeartbeatWait => "heartbeat_wait",
+            Self::HeartbeatStatus => "heartbeat_status",
+            Self::HeartbeatStop => "heartbeat_stop",
+            Self::WithoutSandbox => "without_sandbox",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.as_str() == value)
+    }
+
+    fn input_schema(self) -> Value {
+        match self {
+            Self::SessionInfo => generated_schema::<SessionInfoArgs>(),
+            Self::ReadFile => generated_schema::<ReadFileArgs>(),
+            Self::GetImage => generated_schema::<GetImageArgs>(),
+            Self::ListDirectory => generated_schema::<ListDirectoryArgs>(),
+            Self::WriteFile => generated_schema::<WriteFileArgs>(),
+            Self::Execute => generated_schema::<ExecuteArgs>(),
+            Self::StartCommand => generated_schema::<StartCommandArgs>(),
+            Self::PollJob => generated_schema::<PollJobArgs>(),
+            Self::StopJob => generated_schema::<StopJobArgs>(),
+            Self::HeartbeatStart => generated_schema::<HeartbeatStartArgs>(),
+            Self::HeartbeatWait => generated_schema::<HeartbeatWaitArgs>(),
+            Self::HeartbeatStatus => generated_schema::<HeartbeatStatusArgs>(),
+            Self::HeartbeatStop => generated_schema::<HeartbeatStopArgs>(),
+            Self::WithoutSandbox => generated_schema::<WithoutSandboxArgs>(),
+        }
+    }
+}
+
+fn generated_schema<T: JsonSchema>() -> Value {
+    let mut schema = serde_json::to_value(schemars::schema_for!(T))
+        .expect("tool argument schemas must serialize");
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("$schema");
+        object.remove("title");
+    }
+    schema
+}
+
 fn tools() -> Value {
     #[cfg(not(windows))]
     let write_file_description = "Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory.";
@@ -303,31 +393,69 @@ fn tools() -> Value {
     #[cfg(windows)]
     let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
 
-    let mut tools = json!([
-        {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"read_file","description":"Read a UTF-8 file from the local machine. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
-        {"name":"get_image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false},"_meta":{"ui":{"resourceUri":IMAGE_VIEWER_URI,"visibility":["model","app"]},"openai/outputTemplate":IMAGE_VIEWER_URI,"openai/toolInvocation/invoking":"Reading image…","openai/toolInvocation/invoked":"Image ready"}},
-        {"name":"list_directory","description":"List entries in a local directory. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
-        {"name":"write_file","description":write_file_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
-        {"name":"execute","description":execute_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
-        {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
-        {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
-        {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
-        {"name":"heartbeat_start","description":"Start or reset an in-turn heartbeat schedule for this local-mcp session. After starting it, call heartbeat_wait repeatedly. A tick is delivered only while heartbeat_wait is actively waiting; ticks that occur while the agent is busy doing work are skipped instead of queued.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"interval_seconds":{"type":"integer","minimum":1,"maximum":86400},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id","interval_seconds"],"additionalProperties":false}},
-        {"name":"heartbeat_wait","description":"Wait for the next heartbeat tick in short long-poll chunks. Call this repeatedly until status is tick, then do one work cycle and call it again. If a scheduled tick passes while no heartbeat_wait call is active because the agent is still working, that tick is skipped. This does not revive a ChatGPT turn after the turn has ended.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"max_wait_seconds":{"type":"integer","minimum":1,"maximum":25}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"heartbeat_status","description":"Show the current in-turn heartbeat schedule, delivered tick count, skipped tick count, and time until the next tick.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"heartbeat_stop","description":"Stop and remove an in-turn heartbeat schedule for this local-mcp session.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
-    ]);
-    for tool in tools.as_array_mut().unwrap() {
-        if let Some(session_id) = tool
-            .pointer_mut("/inputSchema/properties/session_id")
-            .and_then(Value::as_object_mut)
-        {
-            session_id.remove("format");
-        }
-    }
-    tools
+    let values = ToolName::ALL
+        .into_iter()
+        .map(|tool| {
+            let description = match tool {
+                ToolName::SessionInfo => {
+                    "Show a local-mcp session's ID, working directory, and allowed sandbox roots."
+                }
+                ToolName::ReadFile => {
+                    "Read a UTF-8 file from the local machine. Relative paths use the session working directory."
+                }
+                ToolName::GetImage => {
+                    "Read a local image and return it as MCP image content. Relative paths use the session working directory."
+                }
+                ToolName::ListDirectory => {
+                    "List entries in a local directory. Relative paths use the session working directory."
+                }
+                ToolName::WriteFile => write_file_description,
+                ToolName::Execute => execute_description,
+                ToolName::StartCommand => start_command_description,
+                ToolName::PollJob => {
+                    "Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed."
+                }
+                ToolName::StopJob => {
+                    "Stop a background command returned by execute or start_command."
+                }
+                ToolName::HeartbeatStart => {
+                    "Start or reset an in-turn heartbeat schedule for this local-mcp session. After starting it, call heartbeat_wait repeatedly. A tick is delivered only while heartbeat_wait is actively waiting; ticks that occur while the agent is busy doing work are skipped instead of queued."
+                }
+                ToolName::HeartbeatWait => {
+                    "Wait for the next heartbeat tick in short long-poll chunks. Call this repeatedly until status is tick, then do one work cycle and call it again. If a scheduled tick passes while no heartbeat_wait call is active because the agent is still working, that tick is skipped. This does not revive a ChatGPT turn after the turn has ended."
+                }
+                ToolName::HeartbeatStatus => {
+                    "Show the current in-turn heartbeat schedule, delivered tick count, skipped tick count, and time until the next tick."
+                }
+                ToolName::HeartbeatStop => {
+                    "Stop and remove an in-turn heartbeat schedule for this local-mcp session."
+                }
+                ToolName::WithoutSandbox => {
+                    "Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode."
+                }
+            };
+            let mut definition = json!({
+                "name": tool.as_str(),
+                "description": description,
+                "inputSchema": tool.input_schema(),
+            });
+            if tool == ToolName::GetImage {
+                definition["_meta"] = json!({
+                    "ui": {"resourceUri": IMAGE_VIEWER_URI, "visibility": ["model", "app"]},
+                    "openai/outputTemplate": IMAGE_VIEWER_URI,
+                    "openai/toolInvocation/invoking": "Reading image…",
+                    "openai/toolInvocation/invoked": "Image ready"
+                });
+            }
+            definition
+        })
+        .collect();
+    Value::Array(values)
+}
+
+fn parse_arguments<T: DeserializeOwned>(tool: ToolName, args: &Value) -> Result<T> {
+    serde_json::from_value(args.clone())
+        .with_context(|| format!("invalid arguments for {}", tool.as_str()))
 }
 
 async fn call_tool(params: &Value) -> Result<Value> {
@@ -335,19 +463,23 @@ async fn call_tool(params: &Value) -> Result<Value> {
         .get("name")
         .and_then(Value::as_str)
         .context("missing tool name")?;
-    let args = params
+    let tool = ToolName::parse(name).with_context(|| format!("unknown tool: {name}"))?;
+    let raw_args = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let session_id = required_session_id(&args)?;
-    let session = config::load_session(&session_id).await?;
-    match name {
-        "session_info" => {
+
+    match tool {
+        ToolName::SessionInfo => {
+            let args: SessionInfoArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
             approvals::activity(&session.id, "Read session info", None).await;
             text_result(serde_json::to_string_pretty(&session)?)
         }
-        "get_image" => {
-            let path = resolve_path(&session.cwd, required_path(&args, "path")?);
+        ToolName::GetImage => {
+            let args: GetImageArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            let path = resolve_path(&session.cwd, PathBuf::from(&args.path));
             let result = get_image(&path).await;
             report_result(
                 &session.id,
@@ -357,8 +489,10 @@ async fn call_tool(params: &Value) -> Result<Value> {
             .await;
             result
         }
-        "read_file" => {
-            let path = resolve_path(&session.cwd, required_path(&args, "path")?);
+        ToolName::ReadFile => {
+            let args: ReadFileArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            let path = resolve_path(&session.cwd, PathBuf::from(&args.path));
             let result = tokio::fs::read_to_string(&path)
                 .await
                 .context("failed to read file");
@@ -370,8 +504,10 @@ async fn call_tool(params: &Value) -> Result<Value> {
             .await;
             text_result(result?)
         }
-        "list_directory" => {
-            let path = resolve_path(&session.cwd, required_path(&args, "path")?);
+        ToolName::ListDirectory => {
+            let args: ListDirectoryArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            let path = resolve_path(&session.cwd, PathBuf::from(&args.path));
             let result = list_directory(&path).await;
             report_result(
                 &session.id,
@@ -381,67 +517,78 @@ async fn call_tool(params: &Value) -> Result<Value> {
             .await;
             text_result(result?)
         }
-        "write_file" => write_file(&args, &session).await,
-        "execute" => execute(&args, &session).await,
-        "start_command" => start_command(&args, &session).await,
-        "poll_job" => poll_job(&args, &session).await,
-        "stop_job" => stop_job(&args, &session).await,
-        "heartbeat_start" => heartbeat_start(&args, &session).await,
-        "heartbeat_wait" => heartbeat_wait(&args, &session).await,
-        "heartbeat_status" => heartbeat_status(&args, &session).await,
-        "heartbeat_stop" => heartbeat_stop(&args, &session).await,
-        "without_sandbox" => without_sandbox(&args, &session).await,
-        _ => anyhow::bail!("unknown tool: {name}"),
+        ToolName::WriteFile => {
+            let args: WriteFileArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            write_file(&args, &session).await
+        }
+        ToolName::Execute => {
+            let args: ExecuteArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            execute(&args, &session).await
+        }
+        ToolName::StartCommand => {
+            let args: StartCommandArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            start_command(&args, &session).await
+        }
+        ToolName::PollJob => {
+            let args: PollJobArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            poll_job(&args, &session).await
+        }
+        ToolName::StopJob => {
+            let args: StopJobArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            stop_job(&args, &session).await
+        }
+        ToolName::HeartbeatStart => {
+            let args: HeartbeatStartArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            heartbeat_start(&args, &session).await
+        }
+        ToolName::HeartbeatWait => {
+            let args: HeartbeatWaitArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            heartbeat_wait(&args, &session).await
+        }
+        ToolName::HeartbeatStatus => {
+            let args: HeartbeatStatusArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            heartbeat_status(&args, &session).await
+        }
+        ToolName::HeartbeatStop => {
+            let args: HeartbeatStopArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            heartbeat_stop(&args, &session).await
+        }
+        ToolName::WithoutSandbox => {
+            let args: WithoutSandboxArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            without_sandbox(&args, &session).await
+        }
     }
 }
 
-fn heartbeat_name(args: &Value) -> Result<String> {
-    let name = args
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or(HEARTBEAT_DEFAULT_NAME);
-    anyhow::ensure!(!name.is_empty(), "heartbeat name must not be empty");
-    anyhow::ensure!(name.len() <= 64, "heartbeat name must be at most 64 bytes");
-    anyhow::ensure!(
-        name.bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
-        "heartbeat name may contain only ASCII letters, digits, '.', '_' and '-'"
-    );
-    Ok(name.to_owned())
+fn heartbeat_name(name: Option<&HeartbeatName>) -> String {
+    name.map(HeartbeatName::as_str)
+        .unwrap_or(HEARTBEAT_DEFAULT_NAME)
+        .to_owned()
 }
 
 fn heartbeat_key(session_id: &str, name: &str) -> (String, String) {
     (session_id.to_owned(), name.to_owned())
 }
 
-fn heartbeat_interval(args: &Value) -> Result<Duration> {
-    let seconds = args
-        .get("interval_seconds")
-        .and_then(Value::as_u64)
-        .context("missing interval_seconds")?;
-    let interval = Duration::from_secs(seconds);
-    anyhow::ensure!(!interval.is_zero(), "interval_seconds must be at least 1");
-    anyhow::ensure!(
-        interval <= HEARTBEAT_MAX_INTERVAL,
-        "interval_seconds must be at most {}",
-        HEARTBEAT_MAX_INTERVAL.as_secs()
-    );
-    Ok(interval)
+fn heartbeat_interval(interval: HeartbeatInterval) -> Duration {
+    Duration::from_secs(interval.seconds())
 }
 
-fn heartbeat_max_wait(args: &Value) -> Result<Duration> {
-    let seconds = args
-        .get("max_wait_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(HEARTBEAT_MAX_WAIT.as_secs());
-    let wait = Duration::from_secs(seconds);
-    anyhow::ensure!(!wait.is_zero(), "max_wait_seconds must be at least 1");
-    anyhow::ensure!(
-        wait <= HEARTBEAT_MAX_WAIT,
-        "max_wait_seconds must be at most {}",
-        HEARTBEAT_MAX_WAIT.as_secs()
-    );
-    Ok(wait)
+fn heartbeat_max_wait(wait: Option<HeartbeatWait>) -> Duration {
+    Duration::from_secs(
+        wait.map(HeartbeatWait::seconds)
+            .unwrap_or(HEARTBEAT_MAX_WAIT_SECONDS),
+    )
 }
 
 fn heartbeat_result(
@@ -461,9 +608,9 @@ fn heartbeat_result(
     }))?)
 }
 
-async fn heartbeat_start(args: &Value, session: &config::Session) -> Result<Value> {
-    let name = heartbeat_name(args)?;
-    let interval = heartbeat_interval(args)?;
+async fn heartbeat_start(args: &HeartbeatStartArgs, session: &config::Session) -> Result<Value> {
+    let name = heartbeat_name(args.name.as_ref());
+    let interval = heartbeat_interval(args.interval_seconds);
     let key = heartbeat_key(&session.id, &name);
     let now = Instant::now();
     let result = {
@@ -484,9 +631,9 @@ async fn heartbeat_start(args: &Value, session: &config::Session) -> Result<Valu
     Ok(result)
 }
 
-async fn heartbeat_wait(args: &Value, session: &config::Session) -> Result<Value> {
-    let name = heartbeat_name(args)?;
-    let max_wait = heartbeat_max_wait(args)?;
+async fn heartbeat_wait(args: &HeartbeatWaitArgs, session: &config::Session) -> Result<Value> {
+    let name = heartbeat_name(args.name.as_ref());
+    let max_wait = heartbeat_max_wait(args.max_wait_seconds);
     let key = heartbeat_key(&session.id, &name);
 
     let (target, generation, wait_for) = {
@@ -509,31 +656,35 @@ async fn heartbeat_wait(args: &Value, session: &config::Session) -> Result<Value
 
     tokio::time::sleep(wait_for).await;
     let now = Instant::now();
-    let mut all = heartbeats().lock().unwrap();
-    let heartbeat = all
-        .get_mut(&key)
-        .with_context(|| format!("heartbeat {name:?} was stopped while waiting"))?;
-    anyhow::ensure!(
-        heartbeat.generation == generation,
-        "heartbeat {name:?} was restarted while waiting"
-    );
-    heartbeat.waiting = false;
+    let (ticked, result) = {
+        let mut all = heartbeats().lock().unwrap();
+        let heartbeat = all
+            .get_mut(&key)
+            .with_context(|| format!("heartbeat {name:?} was stopped while waiting"))?;
+        anyhow::ensure!(
+            heartbeat.generation == generation,
+            "heartbeat {name:?} was restarted while waiting"
+        );
+        heartbeat.waiting = false;
 
-    if now >= target && heartbeat.next_tick == target {
-        heartbeat.delivered_ticks = heartbeat.delivered_ticks.saturating_add(1);
-        heartbeat.next_tick += heartbeat.interval;
-        skip_missed_heartbeat_ticks(heartbeat, now);
-        let result = heartbeat_result(&name, "tick", heartbeat, now);
-        drop(all);
+        if now >= target && heartbeat.next_tick == target {
+            heartbeat.delivered_ticks = heartbeat.delivered_ticks.saturating_add(1);
+            heartbeat.next_tick += heartbeat.interval;
+            skip_missed_heartbeat_ticks(heartbeat, now);
+            (true, heartbeat_result(&name, "tick", heartbeat, now))
+        } else {
+            (false, heartbeat_result(&name, "waiting", heartbeat, now))
+        }
+    };
+
+    if ticked {
         approvals::activity(&session.id, format!("Heartbeat {name} tick"), None).await;
-        return result;
     }
-
-    heartbeat_result(&name, "waiting", heartbeat, now)
+    result
 }
 
-async fn heartbeat_status(args: &Value, session: &config::Session) -> Result<Value> {
-    let name = heartbeat_name(args)?;
+async fn heartbeat_status(args: &HeartbeatStatusArgs, session: &config::Session) -> Result<Value> {
+    let name = heartbeat_name(args.name.as_ref());
     let key = heartbeat_key(&session.id, &name);
     let now = Instant::now();
     let mut all = heartbeats().lock().unwrap();
@@ -551,8 +702,8 @@ async fn heartbeat_status(args: &Value, session: &config::Session) -> Result<Val
     )
 }
 
-async fn heartbeat_stop(args: &Value, session: &config::Session) -> Result<Value> {
-    let name = heartbeat_name(args)?;
+async fn heartbeat_stop(args: &HeartbeatStopArgs, session: &config::Session) -> Result<Value> {
+    let name = heartbeat_name(args.name.as_ref());
     let key = heartbeat_key(&session.id, &name);
     let heartbeat = heartbeats()
         .lock()
@@ -633,22 +784,6 @@ fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn required_path(args: &Value, name: &str) -> Result<PathBuf> {
-    args.get(name)
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .context(format!("missing {name}"))
-}
-
-fn required_session_id(args: &Value) -> Result<String> {
-    let value = args
-        .get("session_id")
-        .and_then(Value::as_str)
-        .context("missing session_id; ask the user to run `local-mcp start` and provide its ID")?;
-    config::validate_session_id(value)?;
-    Ok(value.to_owned())
-}
-
 fn resolve_path(session_cwd: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
@@ -657,10 +792,8 @@ fn resolve_path(session_cwd: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
-fn cwd(args: &Value, session_cwd: &Path) -> Result<PathBuf> {
-    let path = args
-        .get("cwd")
-        .and_then(Value::as_str)
+fn cwd(requested: Option<&str>, session_cwd: &Path) -> Result<PathBuf> {
+    let path = requested
         .map(PathBuf::from)
         .map(|path| resolve_path(session_cwd, path))
         .unwrap_or_else(|| session_cwd.to_owned());
@@ -682,15 +815,12 @@ async fn list_directory(path: &Path) -> Result<String> {
     Ok(names.join("\n"))
 }
 
-async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
-    let absolute = resolve_path(&session.cwd, required_path(args, "path")?);
+async fn write_file(args: &WriteFileArgs, session: &config::Session) -> Result<Value> {
+    let absolute = resolve_path(&session.cwd, PathBuf::from(&args.path));
     let parent = absolute.parent().context("file has no parent directory")?;
     let parent = std::fs::canonicalize(parent)
         .with_context(|| format!("parent does not exist: {}", parent.display()))?;
-    let content = args
-        .get("content")
-        .and_then(Value::as_str)
-        .context("missing content")?;
+    let content = args.content.as_str();
     let previous = tokio::fs::read_to_string(&absolute)
         .await
         .unwrap_or_default();
@@ -736,8 +866,14 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
     text_result(result?)
 }
 
-async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, mut handle) = spawn_sandboxed_command("execute", args, session).await?;
+async fn execute(args: &ExecuteArgs, session: &config::Session) -> Result<Value> {
+    let (rendered_command, mut handle) = spawn_sandboxed_command(
+        "execute",
+        args.command.as_slice(),
+        args.cwd.as_deref(),
+        session,
+    )
+    .await?;
 
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => text_result(joined.context("command task failed")??),
@@ -745,19 +881,25 @@ async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
     }
 }
 
-async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, handle) =
-        spawn_sandboxed_command("start_command", args, session).await?;
+async fn start_command(args: &StartCommandArgs, session: &config::Session) -> Result<Value> {
+    let (rendered_command, handle) = spawn_sandboxed_command(
+        "start_command",
+        args.command.as_slice(),
+        args.cwd.as_deref(),
+        session,
+    )
+    .await?;
     store_job(session, rendered_command, handle, "Started").await
 }
 
 async fn spawn_sandboxed_command(
     operation: &str,
-    args: &Value,
+    command: &[String],
+    requested_cwd: Option<&str>,
     session: &config::Session,
 ) -> Result<(String, JoinHandle<Result<String>>)> {
-    let command = required_command(args)?;
-    let cwd = cwd(args, &session.cwd)?;
+    let command = command.to_vec();
+    let cwd = cwd(requested_cwd, &session.cwd)?;
     #[cfg(windows)]
     if !approvals::request(
         &session.id,
@@ -813,8 +955,8 @@ async fn store_job(
     text_result(json!({"status":"running","job_id":job_id}).to_string())
 }
 
-async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
-    let job_id = required_job_id(args)?;
+async fn poll_job(args: &PollJobArgs, session: &config::Session) -> Result<Value> {
+    let job_id = args.job_id;
     let finished = {
         let jobs = jobs().lock().unwrap();
         let job = jobs.get(&job_id).context("unknown job_id")?;
@@ -833,8 +975,8 @@ async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
     text_result(result?)
 }
 
-async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
-    let job_id = required_job_id(args)?;
+async fn stop_job(args: &StopJobArgs, session: &config::Session) -> Result<Value> {
+    let job_id = args.job_id;
     let job = {
         let mut jobs = jobs().lock().unwrap();
         let job = jobs.get(&job_id).context("unknown job_id")?;
@@ -855,30 +997,9 @@ async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
     text_result(json!({"status":"stopped","job_id":job_id}).to_string())
 }
 
-fn required_job_id(args: &Value) -> Result<Uuid> {
-    let value = args
-        .get("job_id")
-        .and_then(Value::as_str)
-        .context("missing job_id")?;
-    Uuid::parse_str(value).context("invalid job_id")
-}
-
-fn required_command(args: &Value) -> Result<Vec<String>> {
-    args.get("command")
-        .and_then(Value::as_array)
-        .context("missing command")?
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .map(str::to_owned)
-                .context("command entries must be strings")
-        })
-        .collect()
-}
-
-async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
-    let command = required_command(args)?;
-    let cwd = cwd(args, &session.cwd)?;
+async fn without_sandbox(args: &WithoutSandboxArgs, session: &config::Session) -> Result<Value> {
+    let command = args.command.as_slice().to_vec();
+    let cwd = cwd(args.cwd.as_deref(), &session.cwd)?;
     if !approvals::request(
         &session.id,
         "without_sandbox",
@@ -1180,5 +1301,472 @@ mod tests {
         assert_eq!(missed, 5);
         assert_eq!(heartbeat.skipped_ticks, 5);
         assert_eq!(heartbeat.next_tick, start + Duration::from_secs(360));
+    }
+
+    fn minimal_fixture(tool: ToolName) -> Value {
+        let session_id = "schema-contract";
+        match tool {
+            ToolName::SessionInfo => json!({"session_id": session_id}),
+            ToolName::ReadFile | ToolName::GetImage | ToolName::ListDirectory => {
+                json!({"session_id": session_id, "path": "README.md"})
+            }
+            ToolName::WriteFile => {
+                json!({"session_id": session_id, "path": "output.txt", "content": "ok"})
+            }
+            ToolName::Execute | ToolName::StartCommand | ToolName::WithoutSandbox => {
+                json!({"session_id": session_id, "command": ["true"]})
+            }
+            ToolName::PollJob | ToolName::StopJob => json!({
+                "session_id": session_id,
+                "job_id": "00000000-0000-4000-8000-000000000001"
+            }),
+            ToolName::HeartbeatStart => {
+                json!({"session_id": session_id, "interval_seconds": 1})
+            }
+            ToolName::HeartbeatWait | ToolName::HeartbeatStatus | ToolName::HeartbeatStop => {
+                json!({"session_id": session_id})
+            }
+        }
+    }
+
+    fn deserialize_tool_arguments(tool: ToolName, value: &Value) -> Result<()> {
+        match tool {
+            ToolName::SessionInfo => {
+                let _: SessionInfoArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::ReadFile => {
+                let _: ReadFileArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::GetImage => {
+                let _: GetImageArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::ListDirectory => {
+                let _: ListDirectoryArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::WriteFile => {
+                let _: WriteFileArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::Execute => {
+                let _: ExecuteArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::StartCommand => {
+                let _: StartCommandArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::PollJob => {
+                let _: PollJobArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::StopJob => {
+                let _: StopJobArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::HeartbeatStart => {
+                let _: HeartbeatStartArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::HeartbeatWait => {
+                let _: HeartbeatWaitArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::HeartbeatStatus => {
+                let _: HeartbeatStatusArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::HeartbeatStop => {
+                let _: HeartbeatStopArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::WithoutSandbox => {
+                let _: WithoutSandboxArgs = parse_arguments(tool, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn schema_snapshot() -> String {
+        let schemas = ToolName::ALL
+            .into_iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.as_str(),
+                    "inputSchema": tool.input_schema(),
+                })
+            })
+            .collect::<Vec<_>>();
+        format!("{}\n", serde_json::to_string_pretty(&schemas).unwrap())
+    }
+
+    #[test]
+    fn every_declared_tool_deserializes_a_minimal_schema_valid_fixture() {
+        for tool in ToolName::ALL {
+            deserialize_tool_arguments(tool, &minimal_fixture(tool))
+                .unwrap_or_else(|error| panic!("{} fixture failed: {error:#}", tool.as_str()));
+        }
+    }
+
+    #[test]
+    fn typed_arguments_preserve_legacy_unknown_and_null_behavior() {
+        assert!(
+            deserialize_tool_arguments(ToolName::SessionInfo, &json!({})).is_err(),
+            "missing required session_id must fail"
+        );
+        assert!(
+            deserialize_tool_arguments(
+                ToolName::Execute,
+                &json!({"session_id": "schema-contract", "command": "cargo test"}),
+            )
+            .is_err(),
+            "a scalar command must fail"
+        );
+        assert!(
+            deserialize_tool_arguments(
+                ToolName::Execute,
+                &json!({"session_id": "schema-contract", "command": ["cargo", 1]}),
+            )
+            .is_err(),
+            "non-string argv entries must fail"
+        );
+        assert!(
+            deserialize_tool_arguments(
+                ToolName::Execute,
+                &json!({
+                    "session_id": "schema-contract",
+                    "command": ["true"],
+                    "unexpected": true
+                }),
+            )
+            .is_ok(),
+            "execute ignored unknown fields before typed argument migration"
+        );
+        assert!(
+            deserialize_tool_arguments(
+                ToolName::SessionInfo,
+                &json!({"session_id": "schema-contract", "unexpected": true}),
+            )
+            .is_err(),
+            "session_info already rejected unknown fields"
+        );
+        assert!(
+            deserialize_tool_arguments(
+                ToolName::Execute,
+                &json!({"session_id": "schema-contract", "command": ["true"], "cwd": null}),
+            )
+            .is_ok(),
+            "explicit null cwd remains equivalent to omission"
+        );
+        assert!(
+            deserialize_tool_arguments(
+                ToolName::HeartbeatStatus,
+                &json!({"session_id": "schema-contract", "name": null}),
+            )
+            .is_ok(),
+            "explicit null heartbeat name remains equivalent to omission"
+        );
+    }
+
+    fn assert_schema_and_serde_agree(tool: ToolName, value: Value, expected: bool) {
+        let schema = tool.input_schema();
+        let validator = jsonschema::validator_for(&schema)
+            .unwrap_or_else(|error| panic!("{} schema did not compile: {error}", tool.as_str()));
+        let schema_accepts = validator.is_valid(&value);
+        let serde_accepts = deserialize_tool_arguments(tool, &value).is_ok();
+        assert_eq!(
+            schema_accepts,
+            serde_accepts,
+            "schema/Serde mismatch for {} with {value}",
+            tool.as_str()
+        );
+        assert_eq!(
+            schema_accepts,
+            expected,
+            "unexpected contract result for {} with {value}",
+            tool.as_str()
+        );
+    }
+
+    #[test]
+    fn generated_schemas_and_serde_agree_on_boundaries() {
+        let valid_job_id = "00000000-0000-4000-8000-000000000001";
+        let cases = [
+            (
+                ToolName::SessionInfo,
+                json!({"session_id": "schema-contract"}),
+                true,
+            ),
+            (ToolName::SessionInfo, json!({}), false),
+            (ToolName::SessionInfo, json!({"session_id": "."}), false),
+            (ToolName::SessionInfo, json!({"session_id": ".."}), false),
+            (
+                ToolName::SessionInfo,
+                json!({"session_id": "x".repeat(64)}),
+                true,
+            ),
+            (
+                ToolName::SessionInfo,
+                json!({"session_id": "x".repeat(65)}),
+                false,
+            ),
+            (
+                ToolName::SessionInfo,
+                json!({"session_id": "contains spaces"}),
+                false,
+            ),
+            (
+                ToolName::SessionInfo,
+                json!({"session_id": "schema-contract", "extra": true}),
+                false,
+            ),
+            (
+                ToolName::ReadFile,
+                json!({"session_id": "schema-contract", "path": "README.md", "extra": true}),
+                true,
+            ),
+            (
+                ToolName::GetImage,
+                json!({"session_id": "schema-contract", "path": "image.png", "extra": true}),
+                false,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": ["true"]}),
+                true,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": ["true"], "cwd": null}),
+                true,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": ["true"], "cwd": "."}),
+                true,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": ["true"], "cwd": 1}),
+                false,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": []}),
+                false,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": "true"}),
+                false,
+            ),
+            (
+                ToolName::Execute,
+                json!({"session_id": "schema-contract", "command": ["true"], "extra": true}),
+                true,
+            ),
+            (
+                ToolName::PollJob,
+                json!({"session_id": "schema-contract", "job_id": valid_job_id}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 86400}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 0}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 86401}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1, "name": null}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1, "name": ""}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1, "name": "x".repeat(64)}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1, "name": "x".repeat(65)}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatStart,
+                json!({"session_id": "schema-contract", "interval_seconds": 1, "extra": true}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatWait,
+                json!({"session_id": "schema-contract", "name": null, "max_wait_seconds": null}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatWait,
+                json!({"session_id": "schema-contract", "max_wait_seconds": 1}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatWait,
+                json!({"session_id": "schema-contract", "max_wait_seconds": 25}),
+                true,
+            ),
+            (
+                ToolName::HeartbeatWait,
+                json!({"session_id": "schema-contract", "max_wait_seconds": 0}),
+                false,
+            ),
+            (
+                ToolName::HeartbeatWait,
+                json!({"session_id": "schema-contract", "max_wait_seconds": 26}),
+                false,
+            ),
+            (
+                ToolName::WithoutSandbox,
+                json!({"session_id": "schema-contract", "command": ["true"], "cwd": null, "extra": true}),
+                true,
+            ),
+        ];
+
+        for (tool, value, expected) in cases {
+            assert_schema_and_serde_agree(tool, value, expected);
+        }
+    }
+
+    #[test]
+    fn generated_schema_bounds_match_runtime_validation() {
+        let execute = ToolName::Execute.input_schema();
+        assert_eq!(
+            execute
+                .pointer("/properties/command/minItems")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            execute
+                .pointer("/properties/session_id/minLength")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            execute
+                .pointer("/properties/session_id/maxLength")
+                .and_then(Value::as_u64),
+            Some(64)
+        );
+        assert_eq!(
+            execute
+                .pointer("/properties/session_id/pattern")
+                .and_then(Value::as_str),
+            Some("^[A-Za-z0-9._-]+$")
+        );
+        assert_eq!(
+            execute.pointer("/properties/session_id/not/enum"),
+            Some(&json!([".", ".."]))
+        );
+
+        let heartbeat_start = ToolName::HeartbeatStart.input_schema();
+        assert_eq!(
+            heartbeat_start
+                .pointer("/properties/interval_seconds/minimum")
+                .and_then(Value::as_f64),
+            Some(1.0)
+        );
+        assert_eq!(
+            heartbeat_start
+                .pointer("/properties/interval_seconds/maximum")
+                .and_then(Value::as_f64),
+            Some(HEARTBEAT_MAX_INTERVAL_SECONDS as f64)
+        );
+
+        let heartbeat_wait = ToolName::HeartbeatWait.input_schema();
+        assert_eq!(
+            heartbeat_wait
+                .pointer("/properties/max_wait_seconds/minimum")
+                .and_then(Value::as_f64),
+            Some(1.0)
+        );
+        assert_eq!(
+            heartbeat_wait
+                .pointer("/properties/max_wait_seconds/maximum")
+                .and_then(Value::as_f64),
+            Some(HEARTBEAT_MAX_WAIT_SECONDS as f64)
+        );
+    }
+
+    #[test]
+    fn declared_tool_names_and_dispatch_handlers_are_bijective() {
+        let declared = tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let handled = ToolName::ALL
+            .into_iter()
+            .map(|tool| tool.as_str().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(declared, handled);
+        let mut unique = handled.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ToolName::ALL.len());
+        for name in declared {
+            assert!(
+                ToolName::parse(&name).is_some(),
+                "missing handler for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_schemas_preserve_legacy_additional_property_policy() {
+        let strict = [
+            ToolName::SessionInfo,
+            ToolName::GetImage,
+            ToolName::PollJob,
+            ToolName::StopJob,
+            ToolName::HeartbeatStart,
+            ToolName::HeartbeatWait,
+            ToolName::HeartbeatStatus,
+            ToolName::HeartbeatStop,
+        ];
+        for tool in ToolName::ALL {
+            let schema = tool.input_schema();
+            let expected = strict.contains(&tool).then_some(&Value::Bool(false));
+            assert_eq!(
+                schema.get("additionalProperties"),
+                expected,
+                "{} must preserve its pre-refactor unknown-field behavior",
+                tool.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn tool_schemas_match_snapshot() {
+        let actual = schema_snapshot();
+        if std::env::var_os("UPDATE_TOOL_SCHEMA_SNAPSHOT").is_some() {
+            std::fs::write(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/snapshots/tool_schemas.json"
+                ),
+                &actual,
+            )
+            .unwrap();
+            return;
+        }
+        assert_eq!(actual, include_str!("../tests/snapshots/tool_schemas.json"));
     }
 }
