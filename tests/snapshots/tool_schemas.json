@@ -334,6 +334,70 @@
   {
     "inputSchema": {
       "additionalProperties": false,
+      "definitions": {
+        "JobStateFilter": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "stopped",
+            "orphaned"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "limit": {
+          "format": "uint64",
+          "maximum": 100.0,
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/JobStateFilter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "list_jobs"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
       "properties": {
         "interval_seconds": {
           "format": "uint64",

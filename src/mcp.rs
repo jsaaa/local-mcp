@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::tool_args::*;
-use crate::{approvals, command_output, config, sandbox};
+use crate::{approvals, command_output, config, job_journal, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const HEARTBEAT_DEFAULT_NAME: &str = "default";
@@ -153,63 +153,9 @@ struct Job {
     control: sandbox::CommandControl,
 }
 
-#[derive(Clone)]
-enum TerminalOutcome {
-    Success(String),
-    Failure(String),
-}
-
-#[derive(Clone)]
-struct TerminalJob {
-    session_id: String,
-    outcome: TerminalOutcome,
-}
-
 fn jobs() -> &'static Mutex<HashMap<Uuid, Job>> {
     static JOBS: OnceLock<Mutex<HashMap<Uuid, Job>>> = OnceLock::new();
     JOBS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn terminal_jobs() -> &'static Mutex<HashMap<Uuid, TerminalJob>> {
-    static TERMINAL_JOBS: OnceLock<Mutex<HashMap<Uuid, TerminalJob>>> = OnceLock::new();
-    TERMINAL_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn remember_terminal_job(job_id: Uuid, session_id: &str, result: &Result<String>) {
-    const MAX_TERMINAL_JOBS: usize = 256;
-    let outcome = match result {
-        Ok(text) => TerminalOutcome::Success(text.clone()),
-        Err(error) => TerminalOutcome::Failure(format!("{error:#}")),
-    };
-    let mut terminal = terminal_jobs().lock().unwrap();
-    if terminal.len() >= MAX_TERMINAL_JOBS
-        && !terminal.contains_key(&job_id)
-        && let Some(oldest) = terminal.keys().next().copied()
-    {
-        terminal.remove(&oldest);
-    }
-    terminal.insert(
-        job_id,
-        TerminalJob {
-            session_id: session_id.to_owned(),
-            outcome,
-        },
-    );
-}
-
-fn cached_terminal_result(job_id: Uuid, session_id: &str) -> Result<Option<Value>> {
-    let terminal = terminal_jobs().lock().unwrap();
-    let Some(job) = terminal.get(&job_id) else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        job.session_id == session_id,
-        "job does not belong to this session"
-    );
-    match &job.outcome {
-        TerminalOutcome::Success(text) => text_result(text.clone()).map(Some),
-        TerminalOutcome::Failure(error) => anyhow::bail!(error.clone()),
-    }
 }
 
 #[derive(Debug)]
@@ -375,6 +321,7 @@ enum ToolName {
     PollJob,
     StopJob,
     ReadJobLog,
+    ListJobs,
     HeartbeatStart,
     HeartbeatWait,
     HeartbeatStatus,
@@ -383,7 +330,7 @@ enum ToolName {
 }
 
 impl ToolName {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::SessionInfo,
         Self::ReadFile,
         Self::GetImage,
@@ -394,6 +341,7 @@ impl ToolName {
         Self::PollJob,
         Self::StopJob,
         Self::ReadJobLog,
+        Self::ListJobs,
         Self::HeartbeatStart,
         Self::HeartbeatWait,
         Self::HeartbeatStatus,
@@ -413,6 +361,7 @@ impl ToolName {
             Self::PollJob => "poll_job",
             Self::StopJob => "stop_job",
             Self::ReadJobLog => "read_job_log",
+            Self::ListJobs => "list_jobs",
             Self::HeartbeatStart => "heartbeat_start",
             Self::HeartbeatWait => "heartbeat_wait",
             Self::HeartbeatStatus => "heartbeat_status",
@@ -437,6 +386,7 @@ impl ToolName {
             Self::PollJob => generated_schema::<PollJobArgs>(),
             Self::StopJob => generated_schema::<StopJobArgs>(),
             Self::ReadJobLog => generated_schema::<ReadJobLogArgs>(),
+            Self::ListJobs => generated_schema::<ListJobsArgs>(),
             Self::HeartbeatStart => generated_schema::<HeartbeatStartArgs>(),
             Self::HeartbeatWait => generated_schema::<HeartbeatWaitArgs>(),
             Self::HeartbeatStatus => generated_schema::<HeartbeatStatusArgs>(),
@@ -490,13 +440,16 @@ fn tools() -> Value {
                 ToolName::Execute => execute_description,
                 ToolName::StartCommand => start_command_description,
                 ToolName::PollJob => {
-                    "Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed."
+                    "Poll a background command returned by execute or start_command. Returns running while active, or the persisted terminal result; completed, failed, stopped, and orphaned states remain queryable after restart."
                 }
                 ToolName::StopJob => {
-                    "Stop a background command returned by execute or start_command. The command's complete process tree receives a graceful stop followed by forced termination after a bounded grace period; repeated calls return the cached terminal result."
+                    "Stop a background command returned by execute or start_command. The command's complete process tree receives a graceful stop followed by forced termination after a bounded grace period; repeated calls return the persisted terminal result."
                 }
                 ToolName::ReadJobLog => {
                     "Read a bounded byte range from a command's stored stdout or stderr. Use the job_id returned in foreground/background results; access is scoped to the supplied session_id."
+                }
+                ToolName::ListJobs => {
+                    "List persisted jobs for this session with bounded pagination and an optional lifecycle-state filter. Running records without an in-process handle are reported as orphaned."
                 }
                 ToolName::HeartbeatStart => {
                     "Start or reset an in-turn heartbeat schedule for this local-mcp session. After starting it, call heartbeat_wait repeatedly. A tick is delivered only while heartbeat_wait is actively waiting; ticks that occur while the agent is busy doing work are skipped instead of queued."
@@ -626,6 +579,11 @@ async fn call_tool(params: &Value) -> Result<Value> {
             let args: ReadJobLogArgs = parse_arguments(tool, &raw_args)?;
             let session = config::load_session(args.session_id.as_str()).await?;
             read_job_log(&args, &session).await
+        }
+        ToolName::ListJobs => {
+            let args: ListJobsArgs = parse_arguments(tool, &raw_args)?;
+            let session = config::load_session(args.session_id.as_str()).await?;
+            list_jobs(&args, &session).await
         }
         ToolName::HeartbeatStart => {
             let args: HeartbeatStartArgs = parse_arguments(tool, &raw_args)?;
@@ -952,6 +910,17 @@ async fn write_file(args: &WriteFileArgs, session: &config::Session) -> Result<V
     text_result(result?)
 }
 
+fn argv_execution_mode() -> job_journal::ExecutionMode {
+    #[cfg(windows)]
+    {
+        job_journal::ExecutionMode::Unrestricted
+    }
+    #[cfg(not(windows))]
+    {
+        job_journal::ExecutionMode::Sandboxed
+    }
+}
+
 async fn execute(args: &ExecuteArgs, session: &config::Session) -> Result<Value> {
     let (job_id, rendered_command, mut handle, control) = spawn_sandboxed_command(
         "execute",
@@ -1030,8 +999,15 @@ async fn spawn_sandboxed_command(
     if !roots.iter().any(|root| cwd.starts_with(root)) {
         roots.push(cwd.clone());
     }
-    approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
     let job_id = Uuid::new_v4();
+    job_journal::create_running(
+        &session.id,
+        job_id,
+        rendered_command.clone(),
+        cwd.clone(),
+        argv_execution_mode(),
+    )?;
+    approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
     let log_session_id = session.id.clone();
     let report_session_id = session.id.clone();
     let task_command = rendered_command.clone();
@@ -1054,8 +1030,12 @@ async fn spawn_sandboxed_command(
             command_output::render_logged_output(job_id, output)
         }
         .await;
-        report_command_finished(report_session_id, &task_command, &result).await;
-        result
+        let final_result = match job_journal::finish(&report_session_id, job_id, &result) {
+            Ok(_) => result,
+            Err(error) => Err(error.context("failed to persist command result")),
+        };
+        report_command_finished(report_session_id, &task_command, &final_result).await;
+        final_result
     });
     Ok((job_id, rendered_command, handle, control))
 }
@@ -1088,7 +1068,7 @@ async fn store_job(
 
 async fn poll_job(args: &PollJobArgs, session: &config::Session) -> Result<Value> {
     let job_id = args.job_id;
-    let finished = {
+    let in_memory = {
         let jobs = jobs().lock().unwrap();
         match jobs.get(&job_id) {
             Some(job) => {
@@ -1101,18 +1081,14 @@ async fn poll_job(args: &PollJobArgs, session: &config::Session) -> Result<Value
             None => None,
         }
     };
-    match finished {
-        None => cached_terminal_result(job_id, &session.id)?
-            .with_context(|| format!("unknown job_id: {job_id}")),
+
+    match in_memory {
+        None => persisted_job_result(job_journal::load(&session.id, job_id, false)?),
         Some(false) => text_result(json!({"status":"running","job_id":job_id}).to_string()),
         Some(true) => {
             let job = jobs().lock().unwrap().remove(&job_id).unwrap();
-            let result = match job.handle.await {
-                Ok(result) => result,
-                Err(error) => Err(anyhow::anyhow!("background command task failed: {error}")),
-            };
-            remember_terminal_job(job_id, &session.id, &result);
-            text_result(result?)
+            let record = settle_joined_job(&session.id, job_id, job.handle.await)?;
+            persisted_job_result(record)
         }
     }
 }
@@ -1120,45 +1096,126 @@ async fn poll_job(args: &PollJobArgs, session: &config::Session) -> Result<Value
 async fn stop_job(args: &StopJobArgs, session: &config::Session) -> Result<Value> {
     let job_id = args.job_id;
     let job = {
-        let mut jobs = jobs().lock().unwrap();
-        if let Some(job) = jobs.get(&job_id) {
+        let mut all_jobs = jobs().lock().unwrap();
+        if let Some(job) = all_jobs.get(&job_id) {
             anyhow::ensure!(
                 job.session_id == session.id,
                 "job does not belong to this session"
             );
         }
-        jobs.remove(&job_id)
+        all_jobs.remove(&job_id)
     };
 
     let Some(job) = job else {
-        return cached_terminal_result(job_id, &session.id)?
-            .with_context(|| format!("unknown job_id: {job_id}"));
+        return persisted_job_result(job_journal::load(&session.id, job_id, false)?);
     };
 
-    job.control.request_stop();
-    let result = match job.handle.await {
-        Ok(result) => result,
-        Err(error) => Err(anyhow::anyhow!("background command task failed: {error}")),
+    let command = job.command.clone();
+    let was_finished = job.handle.is_finished();
+    if !was_finished {
+        job.control.request_stop();
+    }
+    let record = settle_joined_job(&session.id, job_id, job.handle.await)?;
+    let (title, detail) = if record.state == job_journal::JobState::Stopped {
+        let termination = record
+            .result
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .and_then(|value| value.get("termination")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "stopped".to_owned());
+        (
+            format!("Stopped {command}"),
+            Some(format!("└ job {job_id}; termination {termination}")),
+        )
+    } else {
+        (
+            format!("Stop skipped for finished {command}"),
+            Some(format!("└ job {job_id} already {}", record.state.as_str())),
+        )
     };
-    remember_terminal_job(job_id, &session.id, &result);
-    let termination = result
-        .as_ref()
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .and_then(|value| {
-            value
-                .get("termination")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "failed".to_owned());
+    approvals::activity(&session.id, title, detail).await;
+    persisted_job_result(record)
+}
+
+fn settle_joined_job(
+    session_id: &str,
+    job_id: Uuid,
+    joined: std::result::Result<Result<String>, tokio::task::JoinError>,
+) -> Result<job_journal::JobRecord> {
+    match joined {
+        Ok(result) => job_journal::finish(session_id, job_id, &result),
+        Err(join_error) if join_error.is_cancelled() => {
+            job_journal::mark_stopped(session_id, job_id)
+        }
+        Err(join_error) => {
+            let failure: Result<String> = Err(anyhow::anyhow!(
+                "background command task failed: {join_error}"
+            ));
+            job_journal::finish(session_id, job_id, &failure)
+        }
+    }
+}
+
+fn job_state_filter(state: JobStateFilter) -> job_journal::JobState {
+    match state {
+        JobStateFilter::Running => job_journal::JobState::Running,
+        JobStateFilter::Completed => job_journal::JobState::Completed,
+        JobStateFilter::Failed => job_journal::JobState::Failed,
+        JobStateFilter::Stopped => job_journal::JobState::Stopped,
+        JobStateFilter::Orphaned => job_journal::JobState::Orphaned,
+    }
+}
+
+async fn list_jobs(args: &ListJobsArgs, session: &config::Session) -> Result<Value> {
+    let state = args.state.map(job_state_filter);
+    let offset = args.offset.unwrap_or(0);
+    anyhow::ensure!(offset <= usize::MAX as u64, "offset is too large");
+    let limit = args.limit.map(JobListLimit::value).unwrap_or(50);
+    let active_jobs = {
+        let jobs = jobs().lock().unwrap();
+        jobs.iter()
+            .filter_map(|(job_id, job)| (job.session_id == session.id).then_some(*job_id))
+            .collect::<HashSet<_>>()
+    };
+    let page = job_journal::list(&session.id, &active_jobs, state, offset as usize, limit)?;
     approvals::activity(
         &session.id,
-        format!("Stopped {}", job.command),
-        Some(format!("└ job {job_id}; termination {termination}")),
+        "Listed persisted jobs",
+        Some(format!("└ {} matching jobs", page.total)),
     )
     .await;
-    text_result(result?)
+    text_result(serde_json::to_string_pretty(&page)?)
+}
+
+fn persisted_job_result(record: job_journal::JobRecord) -> Result<Value> {
+    let job_id = record.job_id.clone();
+    match record.state {
+        job_journal::JobState::Completed => text_result(
+            record
+                .result
+                .context("completed job has no persisted result")?,
+        ),
+        job_journal::JobState::Stopped if record.result.is_some() => {
+            text_result(record.result.unwrap())
+        }
+        job_journal::JobState::Failed => {
+            anyhow::bail!(
+                record
+                    .error
+                    .unwrap_or_else(|| "persisted job failed".to_owned())
+            )
+        }
+        state => text_result(
+            json!({
+                "status": state.as_str(),
+                "job_id": job_id,
+                "exit_code": record.exit_code,
+                "error": record.error,
+                "reattachable": record.reattachable,
+            })
+            .to_string(),
+        ),
+    }
 }
 
 async fn read_job_log(args: &ReadJobLogArgs, session: &config::Session) -> Result<Value> {
@@ -1564,6 +1621,32 @@ mod tests {
     }
 
     #[test]
+    fn list_jobs_tool_has_bounded_filterable_schema() {
+        let tool = tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "list_jobs")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            tool.pointer("/inputSchema/properties/limit/maximum"),
+            Some(&json!(JOB_LIST_MAX_LIMIT as f64))
+        );
+        assert_eq!(
+            tool.pointer("/inputSchema/definitions/JobStateFilter/enum"),
+            Some(&json!([
+                "running",
+                "completed",
+                "failed",
+                "stopped",
+                "orphaned"
+            ]))
+        );
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    }
+
+    #[test]
     fn command_activity_summary_uses_bounded_head_and_tail() {
         let text = json!({
             "stdout_head": "first line\n",
@@ -1612,6 +1695,14 @@ mod tests {
             .and_then(render_output)
         });
         let job_id = Uuid::new_v4();
+        job_journal::create_running(
+            &session.id,
+            job_id,
+            "sh -c sleep".to_owned(),
+            directory.clone(),
+            job_journal::ExecutionMode::Unrestricted,
+        )
+        .unwrap();
         jobs().lock().unwrap().insert(
             job_id,
             Job {
@@ -1634,7 +1725,93 @@ mod tests {
         assert!(text.contains("\"termination\":\"stopped\""));
         assert!(text.contains("\"termination_trigger\":\"stop\""));
 
-        terminal_jobs().lock().unwrap().remove(&job_id);
+        job_journal::remove_session_for_tests(&session.id);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_recovers_completed_result_after_in_memory_state_is_lost() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-journal-poll-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = config::Session {
+            id: format!("journal-poll-{}", Uuid::new_v4()),
+            cwd: directory.clone(),
+            permitted_directories: vec![directory.clone()],
+        };
+        let job_id = Uuid::new_v4();
+        job_journal::create_running(
+            &session.id,
+            job_id,
+            "completed command".to_owned(),
+            directory.clone(),
+            argv_execution_mode(),
+        )
+        .unwrap();
+        let completed = Ok(json!({
+            "job_id": job_id,
+            "status": "completed",
+            "exit_code": 0,
+            "termination": "exited",
+            "termination_trigger": null,
+            "stdout_head": "persisted marker",
+            "stdout_tail": "",
+            "stdout_truncated": false,
+            "stderr_head": "",
+            "stderr_tail": "",
+            "stderr_truncated": false
+        })
+        .to_string());
+        job_journal::finish(&session.id, job_id, &completed).unwrap();
+
+        let args: PollJobArgs = serde_json::from_value(json!({
+            "session_id": session.id,
+            "job_id": job_id
+        }))
+        .unwrap();
+        let result = poll_job(&args, &session).await.unwrap();
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("persisted marker")
+        );
+
+        job_journal::remove_session_for_tests(&session.id);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_reports_unrecoverable_running_job_as_orphaned() {
+        let directory =
+            std::env::temp_dir().join(format!("local-mcp-journal-orphan-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let session = config::Session {
+            id: format!("journal-orphan-{}", Uuid::new_v4()),
+            cwd: directory.clone(),
+            permitted_directories: vec![directory.clone()],
+        };
+        let job_id = Uuid::new_v4();
+        job_journal::create_running(
+            &session.id,
+            job_id,
+            "lost command".to_owned(),
+            directory.clone(),
+            argv_execution_mode(),
+        )
+        .unwrap();
+
+        let args: PollJobArgs = serde_json::from_value(json!({
+            "session_id": session.id,
+            "job_id": job_id
+        }))
+        .unwrap();
+        let result = poll_job(&args, &session).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"status\":\"orphaned\""));
+        assert!(text.contains("cannot be reattached"));
+
+        job_journal::remove_session_for_tests(&session.id);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
@@ -1710,6 +1887,7 @@ mod tests {
                 "job_id": "00000000-0000-4000-8000-000000000001",
                 "stream": "stdout"
             }),
+            ToolName::ListJobs => json!({"session_id": session_id}),
             ToolName::HeartbeatStart => {
                 json!({"session_id": session_id, "interval_seconds": 1})
             }
@@ -1750,6 +1928,9 @@ mod tests {
             }
             ToolName::ReadJobLog => {
                 let _: ReadJobLogArgs = parse_arguments(tool, value)?;
+            }
+            ToolName::ListJobs => {
+                let _: ListJobsArgs = parse_arguments(tool, value)?;
             }
             ToolName::HeartbeatStart => {
                 let _: HeartbeatStartArgs = parse_arguments(tool, value)?;
@@ -2130,6 +2311,7 @@ mod tests {
             ToolName::PollJob,
             ToolName::StopJob,
             ToolName::ReadJobLog,
+            ToolName::ListJobs,
             ToolName::HeartbeatStart,
             ToolName::HeartbeatWait,
             ToolName::HeartbeatStatus,

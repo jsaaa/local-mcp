@@ -133,6 +133,43 @@ days are removed, and at most 128 command-log directories are retained per
 session. If all retained entries are active, starting another capture fails
 closed rather than deleting a running command's logs.
 
+### Persistent job journal
+
+Background command lifecycle metadata is persisted below local-mcp's state
+directory in a session-scoped journal. Each update is written to a unique
+temporary file, flushed, and atomically renamed to a versioned JSON snapshot. A
+partial temporary write is ignored and cleaned up; a corrupt latest snapshot
+fails closed for that job without preventing the MCP server from starting.
+
+`poll_job` first checks the live in-memory handle and otherwise loads the journal.
+Completed, failed, and stopped results therefore remain available after restart.
+Calling `stop_job` after a job has already reached a terminal state returns that
+state and result instead of rewriting it. A record still marked `running` with no
+live handle is explicitly changed to `orphaned`; the first journal format does
+not claim that an arbitrary process can be reattached.
+
+Use `list_jobs` to recover IDs or inspect state after a lost response:
+
+```json
+{
+  "session_id": "...",
+  "state": "completed",
+  "offset": 0,
+  "limit": 50
+}
+```
+
+The state filter accepts `running`, `completed`, `failed`, `stopped`, and
+`orphaned`; `limit` is capped at 100. Terminal records older than 30 days are
+removed, and each session has a hard limit of 256 records. Running records are
+not deleted merely to satisfy the count limit; if no terminal record can be
+removed, creation of another job fails closed. Persisted result/error fields are
+capped at 64 KiB of serialized JSON and replaced by a UTF-8-safe head/tail
+envelope when truncated. Rendered commands are bounded, and each complete
+journal snapshot is capped at 128 KiB. Corrupt entries are omitted from list
+results and counted in `corrupt_entries`. On Windows, argv jobs are recorded as
+`unrestricted` because they execute directly on the host after approval.
+
 ### Process-tree lifecycle
 
 Every command is launched with an owned process-tree lifecycle. On Unix,

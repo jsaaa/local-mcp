@@ -12,6 +12,7 @@ use crate::config;
 pub const HEARTBEAT_MAX_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 pub const HEARTBEAT_MAX_WAIT_SECONDS: u64 = 25;
 pub const JOB_LOG_MAX_READ_BYTES: u64 = 64 * 1024;
+pub const JOB_LIST_MAX_LIMIT: u64 = 100;
 
 #[derive(Clone, Debug)]
 pub struct SessionId(String);
@@ -221,6 +222,54 @@ impl JsonSchema for HeartbeatWait {
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum JobStateFilter {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+    Orphaned,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct JobListLimit(u64);
+
+impl JobListLimit {
+    pub fn value(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl<'de> Deserialize<'de> for JobListLimit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if !(1..=JOB_LIST_MAX_LIMIT).contains(&value) {
+            return Err(serde::de::Error::custom(format!(
+                "limit must be between 1 and {JOB_LIST_MAX_LIMIT}"
+            )));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl JsonSchema for JobListLimit {
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn schema_name() -> String {
+        "JobListLimit".to_owned()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        bounded_u64_schema(1, JOB_LIST_MAX_LIMIT)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum JobLogStream {
     Stdout,
     Stderr,
@@ -379,6 +428,18 @@ pub struct PollJobArgs {
 pub struct StopJobArgs {
     pub session_id: SessionId,
     pub job_id: Uuid,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListJobsArgs {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub state: Option<JobStateFilter>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<JobListLimit>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
