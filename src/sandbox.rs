@@ -242,7 +242,7 @@ async fn run_process(
     execution_timeout: Option<Duration>,
     context: &str,
 ) -> Result<Output> {
-    configure_process_group(&mut process);
+    let prepared_tree = prepare_process_tree(&mut process)?;
     process
         .kill_on_drop(true)
         .stdin(if stdin.is_some() {
@@ -257,7 +257,14 @@ async fn run_process(
         .spawn()
         .with_context(|| format!("failed to start {context} command"))?;
     let process_id = child.id().context("spawned command has no process ID")?;
-    let mut tree = ProcessTreeGuard::new(process_id);
+    let mut tree = match prepared_tree.attach(&child, process_id) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error).context("failed to establish process-tree ownership");
+        }
+    };
 
     if let Some(bytes) = stdin
         && let Some(mut child_stdin) = child.stdin.take()
@@ -281,7 +288,7 @@ async fn run_process(
     let (status, termination) = match event {
         WaitEvent::Exited(status) => {
             let status = status.context("failed to wait for command")?;
-            let forced_cleanup = tree.cleanup_after_direct_exit(false).await;
+            let forced_cleanup = tree.cleanup_after_direct_exit(false).await?;
             let termination = if forced_cleanup {
                 Termination::ForcedKill(StopTrigger::Completion)
             } else {
@@ -355,11 +362,11 @@ async fn terminate_and_reap(
     tree: &mut ProcessTreeGuard,
     trigger: StopTrigger,
 ) -> Result<(ExitStatus, Termination)> {
-    tree.request_graceful().await;
+    let graceful_requested = tree.request_graceful().await.is_ok();
     match tokio::time::timeout(TERMINATION_GRACE, child.wait()).await {
         Ok(status) => {
             let status = status.context("failed to reap terminated command")?;
-            let forced_cleanup = tree.cleanup_after_direct_exit(true).await;
+            let forced_cleanup = tree.cleanup_after_direct_exit(graceful_requested).await?;
             let termination = if forced_cleanup {
                 Termination::ForcedKill(trigger)
             } else {
@@ -368,13 +375,13 @@ async fn terminate_and_reap(
             Ok((status, termination))
         }
         Err(_) => {
-            tree.force().await;
+            tree.force().await?;
             let _ = child.start_kill();
             let status = child
                 .wait()
                 .await
                 .context("failed to reap force-killed command")?;
-            tree.finish_forced_cleanup().await;
+            tree.finish_forced_cleanup().await?;
             Ok((status, Termination::ForcedKill(trigger)))
         }
     }
@@ -389,100 +396,186 @@ fn graceful_termination(trigger: StopTrigger) -> Termination {
     }
 }
 
+#[cfg(windows)]
+use self::windows_process_tree::WindowsJob;
+
+struct PreparedProcessTree {
+    #[cfg(windows)]
+    job: WindowsJob,
+}
+
+#[cfg(unix)]
+fn prepare_process_tree(process: &mut Command) -> Result<PreparedProcessTree> {
+    process.process_group(0);
+    Ok(PreparedProcessTree {})
+}
+
+#[cfg(windows)]
+fn prepare_process_tree(process: &mut Command) -> Result<PreparedProcessTree> {
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+    process.creation_flags(CREATE_SUSPENDED);
+    Ok(PreparedProcessTree {
+        job: WindowsJob::new()?,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn prepare_process_tree(_process: &mut Command) -> Result<PreparedProcessTree> {
+    Ok(PreparedProcessTree {})
+}
+
+#[cfg(windows)]
+impl PreparedProcessTree {
+    fn attach(self, child: &Child, process_id: u32) -> Result<ProcessTreeGuard> {
+        self.job.assign_and_resume(child, process_id)?;
+        Ok(ProcessTreeGuard {
+            process_id,
+            armed: true,
+            job: self.job,
+        })
+    }
+}
+
+#[cfg(not(windows))]
+impl PreparedProcessTree {
+    fn attach(self, _child: &Child, process_id: u32) -> Result<ProcessTreeGuard> {
+        Ok(ProcessTreeGuard {
+            process_id,
+            armed: true,
+        })
+    }
+}
+
 struct ProcessTreeGuard {
     process_id: u32,
     armed: bool,
+    #[cfg(windows)]
+    job: WindowsJob,
 }
 
 impl ProcessTreeGuard {
-    fn new(process_id: u32) -> Self {
-        Self {
-            process_id,
-            armed: true,
-        }
-    }
-
     fn disarm(&mut self) {
         self.armed = false;
     }
 
-    async fn request_graceful(&self) {
+    async fn request_graceful(&self) -> Result<()> {
         if self.armed {
-            terminate_tree_async(self.process_id, false).await;
+            terminate_tree_async(self.process_id, false).await?;
+        }
+        Ok(())
+    }
+
+    async fn force(&self) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            self.job.terminate()
+        }
+        #[cfg(not(windows))]
+        {
+            terminate_tree_async(self.process_id, true).await
         }
     }
 
-    async fn force(&self) {
-        if self.armed {
-            terminate_tree_async(self.process_id, true).await;
-        }
-    }
-
-    async fn cleanup_after_direct_exit(&mut self, graceful_already_requested: bool) -> bool {
+    async fn cleanup_after_direct_exit(
+        &mut self,
+        graceful_already_requested: bool,
+    ) -> Result<bool> {
         #[cfg(unix)]
         {
             if !unix_process_group_exists(self.process_id) {
                 self.disarm();
-                return false;
+                return Ok(false);
             }
             if !graceful_already_requested {
-                self.request_graceful().await;
+                self.request_graceful().await?;
             }
             if wait_for_unix_process_group_exit(self.process_id, TERMINATION_GRACE).await {
                 self.disarm();
-                return false;
+                return Ok(false);
             }
-            self.force().await;
+            self.force().await?;
             let _ = wait_for_unix_process_group_exit(self.process_id, TERMINATION_GRACE).await;
             self.disarm();
-            true
+            Ok(true)
         }
         #[cfg(windows)]
         {
-            // taskkill /T is best-effort after the direct process has exited. It
-            // still walks the recorded parent tree on supported Windows builds.
-            if !graceful_already_requested {
-                self.request_graceful().await;
+            if self.job.active_processes()? == 0 {
+                self.disarm();
+                return Ok(false);
             }
-            self.force().await;
+            if !graceful_already_requested {
+                // The direct parent may already be gone. Failure here is not
+                // treated as success; the owned Job Object is verified below
+                // and force-terminated if descendants remain.
+                let _ = self.request_graceful().await;
+            }
+            if wait_for_windows_job_exit(&self.job, TERMINATION_GRACE).await? {
+                self.disarm();
+                return Ok(false);
+            }
+            self.force().await?;
+            anyhow::ensure!(
+                wait_for_windows_job_exit(&self.job, TERMINATION_GRACE).await?,
+                "Windows Job Object still has active processes after termination"
+            );
             self.disarm();
-            false
+            Ok(true)
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = graceful_already_requested;
             self.disarm();
-            false
+            Ok(false)
         }
     }
 
-    async fn finish_forced_cleanup(&mut self) {
+    async fn finish_forced_cleanup(&mut self) -> Result<()> {
         #[cfg(unix)]
         {
             let _ = wait_for_unix_process_group_exit(self.process_id, TERMINATION_GRACE).await;
         }
+        #[cfg(windows)]
+        {
+            anyhow::ensure!(
+                wait_for_windows_job_exit(&self.job, TERMINATION_GRACE).await?,
+                "Windows Job Object still has active processes after forced termination"
+            );
+        }
         self.disarm();
+        Ok(())
     }
 }
 
 impl Drop for ProcessTreeGuard {
     fn drop(&mut self) {
-        if self.armed {
-            terminate_tree_sync(self.process_id, true);
+        if !self.armed {
+            return;
         }
+        #[cfg(unix)]
+        terminate_tree_sync(self.process_id, true);
+        // On Windows, dropping the last Job Object handle enforces
+        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE for every associated process.
     }
 }
 
-#[cfg(unix)]
-fn configure_process_group(process: &mut Command) {
-    process.process_group(0);
-}
-
 #[cfg(windows)]
-fn configure_process_group(_process: &mut Command) {}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_process_group(_process: &mut Command) {}
+async fn wait_for_windows_job_exit(job: &WindowsJob, timeout: Duration) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if job.active_processes()? == 0 {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 #[cfg(unix)]
 fn unix_process_group_exists(process_id: u32) -> bool {
@@ -512,8 +605,9 @@ async fn wait_for_unix_process_group_exit(process_id: u32, timeout: Duration) ->
 }
 
 #[cfg(unix)]
-async fn terminate_tree_async(process_id: u32, force: bool) {
+async fn terminate_tree_async(process_id: u32, force: bool) -> Result<()> {
     terminate_unix_process_group(process_id, force);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -534,7 +628,7 @@ fn terminate_unix_process_group(process_id: u32, force: bool) {
 }
 
 #[cfg(windows)]
-async fn terminate_tree_async(process_id: u32, force: bool) {
+async fn terminate_tree_async(process_id: u32, force: bool) -> Result<()> {
     let mut command = Command::new("taskkill.exe");
     let process_id = process_id.to_string();
     command
@@ -545,29 +639,205 @@ async fn terminate_tree_async(process_id: u32, force: bool) {
     if force {
         command.arg("/F");
     }
-    let _ = command.status().await;
+    let status = command
+        .status()
+        .await
+        .context("failed to run taskkill.exe")?;
+    anyhow::ensure!(status.success(), "taskkill.exe exited with {status}");
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn terminate_tree_async(_process_id: u32, _force: bool) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
-fn terminate_tree_sync(process_id: u32, force: bool) {
-    let mut command = std::process::Command::new("taskkill.exe");
-    let process_id = process_id.to_string();
-    command
-        .args(["/PID", process_id.as_str(), "/T"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if force {
-        command.arg("/F");
+mod windows_process_tree {
+    use std::mem::size_of;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::ptr::{null, null_mut};
+
+    use anyhow::{Context, Result};
+    use tokio::process::Child;
+    #[cfg(test)]
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    };
+    #[cfg(test)]
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    pub struct WindowsJob {
+        handle: Option<OwnedHandle>,
     }
-    let _ = command.status();
+
+    impl WindowsJob {
+        pub fn new() -> Result<Self> {
+            let handle = unsafe { CreateJobObjectW(null(), null()) };
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to create Windows Job Object");
+            }
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+            let job = Self {
+                handle: Some(handle),
+            };
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let success = unsafe {
+                SetInformationJobObject(
+                    job.raw_handle()?,
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if success == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to configure Windows Job Object kill-on-close");
+            }
+            Ok(job)
+        }
+
+        fn raw_handle(&self) -> Result<HANDLE> {
+            self.handle
+                .as_ref()
+                .map(|handle| handle.as_raw_handle() as HANDLE)
+                .context("Windows Job Object handle is closed")
+        }
+
+        pub fn assign_and_resume(&self, child: &Child, process_id: u32) -> Result<()> {
+            let process_handle = child
+                .raw_handle()
+                .context("spawned Windows command has no process handle")?
+                as HANDLE;
+            let success = unsafe { AssignProcessToJobObject(self.raw_handle()?, process_handle) };
+            if success == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to assign command to Windows Job Object");
+            }
+            resume_suspended_process(process_id)
+        }
+
+        pub fn active_processes(&self) -> Result<u32> {
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            let success = unsafe {
+                QueryInformationJobObject(
+                    self.raw_handle()?,
+                    JobObjectBasicAccountingInformation,
+                    (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    null_mut(),
+                )
+            };
+            if success == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to query Windows Job Object accounting");
+            }
+            Ok(accounting.ActiveProcesses)
+        }
+
+        pub fn terminate(&self) -> Result<()> {
+            let success = unsafe { TerminateJobObject(self.raw_handle()?, 1) };
+            if success == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to terminate Windows Job Object");
+            }
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub fn invalidate_for_test(&mut self) {
+            self.handle.take();
+        }
+    }
+
+    fn resume_suspended_process(process_id: u32) -> Result<()> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to enumerate suspended Windows process threads");
+        }
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot as RawHandle) };
+        let mut entry = THREADENTRY32 {
+            dwSize: size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        if unsafe { Thread32First(snapshot.as_raw_handle() as HANDLE, &mut entry) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to read suspended Windows process threads");
+        }
+
+        let mut resumed = 0_usize;
+        loop {
+            if entry.th32OwnerProcessID == process_id {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread.is_null() {
+                    return Err(std::io::Error::last_os_error())
+                        .context("failed to open suspended Windows process thread");
+                }
+                let thread = unsafe { OwnedHandle::from_raw_handle(thread as RawHandle) };
+                let previous_count = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
+                if previous_count == u32::MAX {
+                    return Err(std::io::Error::last_os_error())
+                        .context("failed to resume suspended Windows process thread");
+                }
+                resumed = resumed.saturating_add(1);
+            }
+
+            if unsafe { Thread32Next(snapshot.as_raw_handle() as HANDLE, &mut entry) } == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    break;
+                }
+                return Err(error).context("failed while enumerating Windows process threads");
+            }
+        }
+        anyhow::ensure!(
+            resumed > 0,
+            "no suspended thread was found for spawned Windows process {process_id}"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn process_is_running(process_id: u32) -> Result<bool> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                process_id,
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return Ok(false);
+            }
+            return Err(error).context("failed to open Windows process for liveness check");
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+        match unsafe { WaitForSingleObject(handle.as_raw_handle() as HANDLE, 0) } {
+            WAIT_OBJECT_0 => Ok(false),
+            WAIT_TIMEOUT => Ok(true),
+            result => anyhow::bail!(
+                "WaitForSingleObject failed for process {process_id}: result={result}, error={}",
+                std::io::Error::last_os_error()
+            ),
+        }
+    }
 }
-
-#[cfg(not(any(unix, windows)))]
-async fn terminate_tree_async(_process_id: u32, _force: bool) {}
-
-#[cfg(not(any(unix, windows)))]
-fn terminate_tree_sync(_process_id: u32, _force: bool) {}
 
 fn safe_environment() -> HashMap<String, String> {
     [
@@ -819,6 +1089,108 @@ mod process_tree_tests {
         assert!(task.await.unwrap_err().is_cancelled());
         wait_until_gone([process_ids.0, process_ids.1]).await;
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_process_tree_tests {
+    use std::process::Stdio as StdStdio;
+
+    use super::*;
+    use crate::sandbox::windows_process_tree::process_is_running;
+    use uuid::Uuid;
+
+    const PARENT_HELPER: &str =
+        "sandbox::windows_process_tree_tests::parent_exits_after_spawning_helper";
+    const CHILD_HELPER: &str = "sandbox::windows_process_tree_tests::long_lived_descendant_helper";
+    const PID_FILE_ENV: &str = "LOCAL_MCP_WINDOWS_TREE_PID_FILE";
+
+    fn test_directory() -> PathBuf {
+        std::env::temp_dir().join(format!("local-mcp-windows-tree-test-{}", Uuid::new_v4()))
+    }
+
+    fn cmd_set_value(value: &str) -> String {
+        value.replace('%', "%%").replace('"', "\"")
+    }
+
+    #[test]
+    #[ignore = "spawned only by the Windows process-tree integration test"]
+    fn long_lived_descendant_helper() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "spawned only by the Windows process-tree integration test"]
+    fn parent_exits_after_spawning_helper() {
+        let pid_file = PathBuf::from(
+            std::env::var_os(PID_FILE_ENV).expect("Windows process-tree PID file is not set"),
+        );
+        let executable = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(executable)
+            .args(["--ignored", "--exact", CHILD_HELPER, "--nocapture"])
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::null())
+            .stderr(StdStdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::write(pid_file, child.id().to_string()).unwrap();
+        // Dropping std::process::Child does not terminate it. The helper exits
+        // immediately and leaves the long-lived descendant owned by the Job.
+    }
+
+    #[tokio::test]
+    async fn parent_exit_cleans_job_owned_descendant_before_returning() {
+        let directory = test_directory();
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let pid_file = directory.join("child.pid");
+        let executable = std::env::current_exe().unwrap();
+        let wrapper = directory.join("spawn-parent.cmd");
+        let script = format!(
+            "@echo off\r\nset \"{PID_FILE_ENV}={}\"\r\n\"{}\" --ignored --exact {PARENT_HELPER} --nocapture\r\n",
+            cmd_set_value(&pid_file.to_string_lossy()),
+            cmd_set_value(&executable.to_string_lossy()),
+        );
+        tokio::fs::write(&wrapper, script).await.unwrap();
+        let command = vec![
+            "cmd.exe".to_owned(),
+            "/D".to_owned(),
+            "/C".to_owned(),
+            wrapper.to_string_lossy().into_owned(),
+        ];
+        let (control, cancellation) = command_control();
+        let output = run_unrestricted_controlled(&command, &directory, None, cancellation, None)
+            .await
+            .unwrap();
+        drop(control);
+        let child_id = tokio::fs::read_to_string(&pid_file)
+            .await
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+
+        assert_eq!(output.status, 0);
+        assert_eq!(
+            output.termination,
+            Termination::ForcedKill(StopTrigger::Completion)
+        );
+        assert!(!process_is_running(child_id).unwrap());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_query_failure_is_returned_instead_of_normal_exit() {
+        let mut job = WindowsJob::new().unwrap();
+        job.invalidate_for_test();
+        let mut tree = ProcessTreeGuard {
+            process_id: 0,
+            armed: true,
+            job,
+        };
+
+        let error = tree.cleanup_after_direct_exit(false).await.unwrap_err();
+        assert!(error.to_string().contains("handle is closed"));
+        tree.disarm();
     }
 }
 
